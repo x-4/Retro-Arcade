@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+
+jobs:
+  test-and-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Syntax check all modules
+        run: |
+          for f in index.js src/*.js public/game.js public/sw.js test/e2e.test.js; do
+            node --check "$f"
+          done
+
+      - name: Validate configuration & CLI flags
+        run: npm run check
+
+      - name: Run full E2E & unit regression suite
+        run: npm test
+
+      - name: Validate Docker Compose & build container image
+        run: |
+          docker compose config --quiet
+          docker build -t neon-pixel-arcade:ci .
+

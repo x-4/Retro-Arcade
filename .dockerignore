@@ -1,0 +1,17 @@
+node_modules
+.git
+.github
+.gitignore
+.dockerignore
+.env
+.env.example
+Dockerfile
+docker-compose.yml
+README.md
+uuid
+arcade-scores.json
+arcade-syncd.pid
+.cache-sync
+test
+*.log
+*.tmp-*

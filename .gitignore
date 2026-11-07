@@ -1,0 +1,10 @@
+node_modules/
+.env
+uuid
+arcade-scores.json
+arcade-syncd.pid
+.cache-sync/
+coverage/
+*.log
+*.tmp-*
+
