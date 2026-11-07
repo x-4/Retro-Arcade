@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>RETRO ARCADE // 复古街机合集</title>
+  <link rel="manifest" href="/manifest.json">
+  <meta name="theme-color" content="#00f5d4">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="crt-overlay"></div>
+  <main class="cabinet" id="cabinet">
+    <header class="marquee">
+      <div class="brand">
+        <span class="badge" id="phaseBadge">STANDBY</span>
+        <h1>NEON PIXEL</h1>
+      </div>
+      <nav class="tabs" role="tablist" aria-label="选择游戏">
+        <button class="tab active" data-game="snake" role="tab" aria-selected="true">🐍 贪吃蛇 SNAKE</button>
+        <button class="tab" data-game="breakout" role="tab" aria-selected="false">🧱 打砖块 BREAKOUT</button>
+        <button class="tab" data-game="invaders" role="tab" aria-selected="false">🚀 星际战机 INVADERS</button>
+        <button class="tab" data-game="runner" role="tab" aria-selected="false">⚡ 赛博疾行 RUNNER</button>
+      </nav>
+    </header>
+
+    <section class="hud">
+      <div class="stat">
+        <span class="label">SCORE</span>
+        <span class="value" id="score">0000</span>
+      </div>
+      <div class="stat">
+        <span class="label">SERVER HIGH</span>
+        <span class="value" id="highScore">0000</span>
+      </div>
+      <div class="stat">
+        <span class="label" id="extraLabel">SPEED</span>
+        <span class="value" id="extraValue">1x</span>
+      </div>
+      <div class="stat">
+        <span class="label">ETHER BOOST</span>
+        <span class="value cyan" id="boostValue">1.00x</span>
+      </div>
+      <div class="actions">
+        <button class="icon-btn" id="boardBtn" title="全服排行榜 (L)">🏆</button>
+        <button class="icon-btn" id="bgmBtn" title="8-Bit 合成器音乐开关 (B)">🎵</button>
+        <button class="icon-btn" id="soundBtn" title="音效开关 (M)">🔊</button>
+        <button class="icon-btn" id="pauseBtn" title="暂停/继续 (P)">⏸</button>
+        <button class="icon-btn" id="restartBtn" title="重新开始 (R)">↻</button>
+        <button class="icon-btn" id="fsBtn" title="全屏街机框体模式 (F)">⛶</button>
+      </div>
+    </section>
+
+    <div class="pulse-bar" title="实时以太能量场（与服务器网络律动同步，提升积分倍率与稀有果实概率）">
+      <div class="pulse-fill" id="pulseFill"></div>
+      <div class="pulse-meta">
+        <span id="pulseText">ETHER FLUX: 0.0 KB/s · NODES: 1</span>
+        <span id="playsText">TOTAL SESSIONS: 0</span>
+      </div>
+    </div>
+
+    <div class="screen-wrap">
+      <canvas id="stage" width="600" height="450"></canvas>
+      <div class="overlay" id="overlay">
+        <h2 id="overlayTitle">NEON SNAKE</h2>
+        <p id="overlayDesc">吃掉能量果实不断成长，切勿撞墙或咬到自身！</p>
+
+        <div class="score-submit hidden" id="scoreSubmit">
+          <input type="text" id="playerName" maxlength="8" placeholder="输入街机代号 (如 NEO)" autocomplete="off">
+          <button class="submit-btn" id="submitScoreBtn">上传战绩</button>
+        </div>
+
+        <div class="leaderboard-box" id="leaderboardBox">
+          <div class="lb-title">🏆 全服街机风云榜 TOP 5</div>
+          <ol class="lb-list" id="lbList"></ol>
+        </div>
+
+        <button class="primary-btn" id="startBtn">INSERT COIN / 开始游戏</button>
+        <div class="hint" id="overlayHint">键盘 方向键 / WASD 控制 · 空格键开始/暂停</div>
+      </div>
+    </div>
+
+    <section class="achievements-bar" id="achievementsBar" aria-label="街机成就徽章">
+      <div class="ach-list" id="achList">
+        <span class="ach-item" data-ach="first_blood" title="初露锋芒：单局得分突破 100 分">🩸 FIRST BLOOD</span>
+        <span class="ach-item" data-ach="hyper_viper" title="疾速灵蛇：贪吃蛇达成 5x 连击">🐍 HYPER VIPER</span>
+        <span class="ach-item" data-ach="brick_master" title="破壁大师：打砖块突破第 2 关或触发多球">🧱 BRICK MASTER</span>
+        <span class="ach-item" data-ach="boss_slayer" title="母舰克星：星际战机击毁巨型母舰 Boss">🛸 BOSS SLAYER</span>
+        <span class="ach-item" data-ach="cyber_phantom" title="赛博幻影：赛博疾行触发极限擦弹 GRAZE">⚡ CYBER PHANTOM</span>
+        <span class="ach-item" data-ach="overdrive" title="超频共振：单局突破 1500 分">🌌 OVERDRIVE</span>
+      </div>
+      <span class="gamepad-pill" id="gamepadStatus" title="连接 USB/蓝牙手柄即可自动启用摇杆与双马达震动反馈">🎮 PAD STANDBY</span>
+    </section>
+
+    <section class="touch-controls" aria-label="触屏控制">
+      <div class="dpad" id="snakePad">
+        <button class="pad-btn up" data-dir="up">▲</button>
+        <button class="pad-btn left" data-dir="left">◀</button>
+        <button class="pad-btn right" data-dir="right">▶</button>
+        <button class="pad-btn down" data-dir="down">▼</button>
+      </div>
+      <div class="lrpad hidden" id="breakoutPad">
+        <button class="pad-btn wide" data-move="left">◀ 左移</button>
+        <button class="pad-btn wide launch" id="actionPadBtn" data-move="launch">● 发球</button>
+        <button class="pad-btn wide" data-move="right">右移 ▶</button>
+      </div>
+    </section>
+
+    <footer class="footer">
+      <span>操作：[1-4] 切游戏 · [WASD/方向键/手柄] 移动 · [Space] 动作 · [B] 音乐 · [M] 音效 · [F] 全屏 · [R] 重开</span>
+      <span class="ver">OPEN ARCADE ENGINE v2.1 · PWA &amp; GAMEPAD</span>
+    </footer>
+  </main>
+  <script src="/game.js"></script>
+</body>
+</html>

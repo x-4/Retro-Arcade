@@ -1,0 +1,24 @@
+services:
+  neon-arcade:
+    build: .
+    image: neon-pixel-arcade:latest
+    container_name: neon-arcade
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${PORT:-8080}:${PORT:-8080}/tcp"
+    environment:
+      PORT: "${PORT:-8080}"
+      UUID: "${UUID:-}"
+      TOKEN: "${TOKEN:-}"
+    volumes:
+      - arcade-cache:/app/.cache-sync
+    healthcheck:
+      test: ["CMD", "node", "/app/index.js", "--healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  arcade-cache:

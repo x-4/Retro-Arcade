@@ -1,0 +1,17 @@
+{
+  "name": "neon-pixel-arcade",
+  "version": "2.1.0",
+  "description": "Neon Pixel Retro Arcade Web Application (Snake, Breakout, Galaxy Invaders & Cyber Runner) with real-time sync engine",
+  "main": "index.js",
+  "private": true,
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "check": "node index.js --check",
+    "healthcheck": "node index.js --healthcheck",
+    "test": "node test/e2e.test.js"
+  },
+  "license": "MIT"
+}
