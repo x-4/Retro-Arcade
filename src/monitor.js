@@ -147,11 +147,11 @@ function renderAdminHtml(uuidText) {
     <div class="card"><span class="lbl">UPTIME / RSS</span><span class="val" id="vSys">0s / 0MB</span></div>
   </div>
   <div class="panel">
-    <h2>📈 实时网络流量波形示波器 (Live Traffic &amp; Edge Oscilloscope)</h2>
+    <h2>📈 实时网络流量波形示波器 (Live Traffic &amp; Oscilloscope)</h2>
     <canvas id="waveCanvas" width="920" height="90" style="width:100%;height:90px;background:#030408;border:1px solid rgba(0,245,212,.3);border-radius:4px;margin-top:6px;display:block;"></canvas>
     <div style="display:flex;justify-content:space-between;font-size:11px;color:#8fa6cb;margin-top:6px;">
       <span id="waveFluxText">CURRENT FLUX: 0 KB/s · SAMPLING: 3000ms</span>
-      <span id="waveEdgeNodes">EDGE REGIONS: [LAX: READY] [SJC: READY] [HKG: READY]</span>
+      <span id="waveEdgeNodes">MODE: LOCAL (STANDALONE)</span>
     </div>
   </div>
   <div class="panel">
@@ -225,6 +225,10 @@ function renderAdminHtml(uuidText) {
       lastTot = tot;
       drawWave(inst);
       document.getElementById('waveFluxText').textContent = 'CURRENT FLUX: ' + fmtB(inst) + '/s · SAMPLING: 3000ms · OSCILLOSCOPE ACTIVE';
+      const edgeLabel = d.edge
+        ? (d.edge.ready ? 'TUNNEL: ACTIVE (HA x' + (d.edge.haConnections || 1) + ')' : 'TUNNEL: SYNCING...')
+        : 'MODE: LOCAL (STANDALONE)';
+      document.getElementById('waveEdgeNodes').textContent = edgeLabel;
       document.getElementById('statusBadge').textContent = d.draining ? 'DRAINING' : 'ONLINE';
       document.getElementById('vSelf').textContent = d.selfCheck && d.selfCheck.ok ? 'HEALTHY' : 'WARN';
       document.getElementById('vEdge').textContent = d.edge ? (d.edge.ready ? 'READY (' + d.edge.protocol + ' · ' + (d.edge.haConnections || 1) + 'x)' : 'SYNCING') : 'LOCAL';
