@@ -376,8 +376,13 @@ function interleaveAddresses(list, preferredIp) {
   }
   const out = [];
   if (pref) out.push(pref);
-  // IPv4 优先排列，IPv6 作为回退（避免双栈环境因云厂商 IPv6 归属地漂移导致目标站点地区误判，同时兼容纯 IPv6 目标）
-  return out.concat(v4, v6);
+  // RFC 8305 Happy Eyeballs v2 双栈交替穿插排列（IPv4 与 IPv6 轮流尝试，避免全单栈连接超时造成首包延迟）
+  const maxLen = Math.max(v4.length, v6.length);
+  for (let i = 0; i < maxLen; i++) {
+    if (i < v4.length) out.push(v4[i]);
+    if (i < v6.length) out.push(v6[i]);
+  }
+  return out;
 }
 
 function fetchDnsList(host, entry) {
@@ -535,7 +540,7 @@ async function connectTcp(host, port) {
       sock.once('error', onErr);
 
       if (nextIdx < candidates.length) {
-        staggerTimer = setTimeout(tryNext, 250);
+        staggerTimer = setTimeout(tryNext, 200);
         staggerTimer.unref();
       }
     };

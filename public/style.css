@@ -333,6 +333,27 @@ canvas {
   letter-spacing: 1px;
   margin-bottom: 6px;
   text-align: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+
+.ghost-btn {
+  background: rgba(0, 245, 212, 0.15);
+  border: 1px solid var(--neon-cyan);
+  color: var(--neon-cyan);
+  font-family: inherit;
+  font-size: 10px;
+  padding: 2px 7px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.ghost-btn:hover {
+  background: var(--neon-cyan);
+  color: #0d0f1a;
+  box-shadow: 0 0 8px var(--neon-cyan);
 }
 
 .lb-list {

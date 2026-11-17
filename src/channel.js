@@ -41,6 +41,7 @@ class Channel {
     this.headerTimer = null;
     this.uplinkGraceTimer = null;
     this.downCount = 0;
+    this.lastDrainLatency = 0;
     registry.add(this);
   }
 
@@ -161,7 +162,11 @@ class Channel {
       this.touch();
       if (!this.sendDown(c)) {
         sock.pause();
-        this.down.drain(() => sock.resume());
+        const pauseAt = Date.now();
+        this.down.drain(() => {
+          this.lastDrainLatency = Date.now() - pauseAt;
+          if (!sock.destroyed) sock.resume();
+        });
       }
     });
     sock.on('end', () => this._finishDown());

@@ -15,7 +15,7 @@ const { isPrivateIP } = require('./netutil');
 const { Channel, registry } = require('./channel');
 const { closedSessions, sessions, upsertSession } = require('./session');
 const { snapshot, prometheusMetrics, renderAdminHtml } = require('./monitor');
-const { getPulseBuffer, recordScore, recordTelemetry } = require('./arcade');
+const { getPulseBuffer, recordScore, recordTelemetry, listReplays, getReplay, recordReplay } = require('./arcade');
 
 // ───────────────────────────── 静态站点（复古街机前端，带异步内存缓存 + ETag + Gzip） ─────────────────────────────
 
@@ -409,6 +409,48 @@ async function handleArcadeApi(req, res, pathname, query) {
     let body;
     try { body = JSON.parse(raw.toString('utf8')); } catch { respond(res, 400); return true; }
     const out = recordScore(body && body.game, body && body.name, body && body.score, clientIp(req));
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store');
+    res.statusCode = out.ok ? 200 : (out.status || 400);
+    res.end(JSON.stringify(out));
+    return true;
+  }
+
+  // 5) 全服幽灵回放轨迹列表与详情（GET /api/v1/replays, GET /api/v1/replays/<id>）
+  const isReplaysGet = (pathname === '/api/v1/replays' || pathname.startsWith('/api/v1/replays/') ||
+    rest === 'replays' || (rest && rest.startsWith('replays/'))) && (req.method === 'GET' || req.method === 'HEAD');
+  if (isReplaysGet) {
+    const subPath = pathname.startsWith('/api/v1/replays/') ? pathname.slice('/api/v1/replays/'.length) :
+      (rest && rest.startsWith('replays/') ? rest.slice('replays/'.length) : '');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader(PAD_HEADER, paddingValue());
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store');
+    if (subPath) {
+      const rep = getReplay(subPath);
+      if (!rep) { respond(res, 404); return true; }
+      const buf = Buffer.from(JSON.stringify({ ok: true, replay: rep }));
+      res.setHeader('Content-Length', buf.length);
+      res.end(req.method === 'HEAD' ? undefined : buf);
+      return true;
+    }
+    const qGame = (query.match(/(?:^|&)game=([^&]+)/) || [])[1] || '';
+    const list = listReplays(qGame ? decodeURIComponent(qGame) : undefined);
+    const buf = Buffer.from(JSON.stringify({ ok: true, replays: list }));
+    res.setHeader('Content-Length', buf.length);
+    res.end(req.method === 'HEAD' ? undefined : buf);
+    return true;
+  }
+
+  // 6) 幽灵操作轨迹与战绩提交（POST /api/v1/replays）
+  const isReplaysPost = (pathname === '/api/v1/replays' || rest === 'replays') && req.method === 'POST';
+  if (isReplaysPost) {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader(PAD_HEADER, paddingValue());
+    const raw = await readBody(req, 65536);
+    let body;
+    try { body = JSON.parse(raw.toString('utf8')); } catch { respond(res, 400); return true; }
+    const out = recordReplay(body, clientIp(req));
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     res.setHeader('Cache-Control', 'no-store');
     res.statusCode = out.ok ? 200 : (out.status || 400);

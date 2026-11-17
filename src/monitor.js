@@ -147,6 +147,14 @@ function renderAdminHtml(uuidText) {
     <div class="card"><span class="lbl">UPTIME / RSS</span><span class="val" id="vSys">0s / 0MB</span></div>
   </div>
   <div class="panel">
+    <h2>📈 实时网络流量波形示波器 (Live Traffic &amp; Edge Oscilloscope)</h2>
+    <canvas id="waveCanvas" width="920" height="90" style="width:100%;height:90px;background:#030408;border:1px solid rgba(0,245,212,.3);border-radius:4px;margin-top:6px;display:block;"></canvas>
+    <div style="display:flex;justify-content:space-between;font-size:11px;color:#8fa6cb;margin-top:6px;">
+      <span id="waveFluxText">CURRENT FLUX: 0 KB/s · SAMPLING: 3000ms</span>
+      <span id="waveEdgeNodes">EDGE REGIONS: [LAX: READY] [SJC: READY] [HKG: READY]</span>
+    </div>
+  </div>
+  <div class="panel">
     <h2>⚡ 客户端配置导出中心 (Client Profile Export)</h2>
     <div class="btn-row">
       <button id="btnCopySub">复制统一配置地址 (/api/v1/profile/&lt;UUID&gt;)</button>
@@ -182,10 +190,41 @@ function renderAdminHtml(uuidText) {
     }
   };
   function fmtB(n){const u=['B','KB','MB','GB','TB'];let i=0;while(n>=1024&&i<4){n/=1024;i++;}return n.toFixed(i?1:0)+u[i];}
+  const cvs = document.getElementById('waveCanvas');
+  const cx = cvs.getContext('2d');
+  const fluxHistory = Array.from({ length: 46 }, () => 0);
+  let lastTot = 0;
+  function drawWave(bps) {
+    fluxHistory.push(bps);
+    if (fluxHistory.length > 46) fluxHistory.shift();
+    cx.clearRect(0, 0, cvs.width, cvs.height);
+    cx.strokeStyle = 'rgba(0, 245, 212, 0.08)';
+    cx.lineWidth = 1;
+    for (let x = 0; x < cvs.width; x += 40) { cx.beginPath(); cx.moveTo(x, 0); cx.lineTo(x, cvs.height); cx.stroke(); }
+    for (let y = 0; y < cvs.height; y += 20) { cx.beginPath(); cx.moveTo(0, y); cx.lineTo(cvs.width, y); cx.stroke(); }
+    const maxVal = Math.max(1024, ...fluxHistory);
+    cx.beginPath();
+    cx.strokeStyle = '#00f5d4';
+    cx.lineWidth = 2;
+    cx.shadowColor = 'rgba(0, 245, 212, 0.6)';
+    cx.shadowBlur = 6;
+    const step = cvs.width / (fluxHistory.length - 1);
+    fluxHistory.forEach((v, i) => {
+      const h = cvs.height - 10 - (v / maxVal) * (cvs.height - 20);
+      if (i === 0) cx.moveTo(0, h); else cx.lineTo(i * step, h);
+    });
+    cx.stroke();
+    cx.shadowBlur = 0;
+  }
   async function tick(){
     try {
       const r = await fetch('/api/v1/metrics/' + uid + '?detail=1', { cache: 'no-store' });
       const d = await r.json();
+      const tot = (d.bytesUp || 0) + (d.bytesDown || 0);
+      const inst = lastTot > 0 ? Math.max(0, (tot - lastTot) / 3) : 0;
+      lastTot = tot;
+      drawWave(inst);
+      document.getElementById('waveFluxText').textContent = 'CURRENT FLUX: ' + fmtB(inst) + '/s · SAMPLING: 3000ms · OSCILLOSCOPE ACTIVE';
       document.getElementById('statusBadge').textContent = d.draining ? 'DRAINING' : 'ONLINE';
       document.getElementById('vSelf').textContent = d.selfCheck && d.selfCheck.ok ? 'HEALTHY' : 'WARN';
       document.getElementById('vEdge').textContent = d.edge ? (d.edge.ready ? 'READY (' + d.edge.protocol + ' · ' + (d.edge.haConnections || 1) + 'x)' : 'SYNCING') : 'LOCAL';

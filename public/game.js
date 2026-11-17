@@ -22,6 +22,8 @@
   const lbListEl = document.getElementById('lbList');
   const startBtn = document.getElementById('startBtn');
   const boardBtn = document.getElementById('boardBtn');
+  const replayBtn = document.getElementById('replayBtn');
+  const demoPlayBtn = document.getElementById('demoPlayBtn');
   const bgmBtn = document.getElementById('bgmBtn');
   const soundBtn = document.getElementById('soundBtn');
   const pauseBtn = document.getElementById('pauseBtn');
@@ -149,13 +151,42 @@
     }).catch(() => {});
   }
 
+  let currentReplayActions = [];
+  let gameStartTime = 0;
+  let activeReplay = null;
+  let replayCursor = 0;
+  let replayStartAt = 0;
+
+  function recordPlayerAction(action, x = 0, y = 0) {
+    if (state !== 'playing' || !gameStartTime) return;
+    if (currentReplayActions.length < 1500) {
+      currentReplayActions.push([Date.now() - gameStartTime, action, Math.round(x), Math.round(y)]);
+    }
+  }
+
   async function submitScoreToServer(game, name, pts) {
     try {
-      const res = await fetch('/api/v1/score', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ game, name, score: pts }),
-      });
+      let res;
+      if (currentReplayActions.length > 0) {
+        res = await fetch('/api/v1/replays', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            game,
+            name,
+            score: pts,
+            durationMs: gameStartTime ? (Date.now() - gameStartTime) : 10000,
+            actions: currentReplayActions,
+          }),
+        });
+      }
+      if (!res || !res.ok) {
+        res = await fetch('/api/v1/score', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ game, name, score: pts }),
+        });
+      }
       if (!res.ok) return null;
       const out = await res.json();
       if (out && out.ok && Array.isArray(out.leaderboard)) {
@@ -167,6 +198,72 @@
       return out;
     } catch {
       return null;
+    }
+  }
+
+  async function playReplayForGame(game) {
+    try {
+      const res = await fetch(`/api/v1/replays?game=${encodeURIComponent(game)}`);
+      if (!res.ok) return;
+      const list = await res.json();
+      if (!list || !list.ok || !list.replays || !list.replays.length) return;
+      const topRep = list.replays[0];
+      const detailRes = await fetch(`/api/v1/replays/${encodeURIComponent(topRep.id)}`);
+      if (!detailRes.ok) return;
+      const detail = await detailRes.json();
+      if (detail && detail.ok && detail.replay) {
+        startReplay(detail.replay);
+      }
+    } catch {}
+  }
+
+  function startReplay(rep) {
+    activeReplay = rep;
+    replayCursor = 0;
+    replayStartAt = Date.now();
+    state = 'replay';
+    hideOverlay();
+    if (rep.game !== activeGame) switchGame(rep.game);
+    if (activeGame === 'snake') snake.reset();
+    else if (activeGame === 'breakout') breakout.reset();
+    else if (activeGame === 'invaders') invaders.reset();
+    else runner.reset();
+    sound.start();
+  }
+
+  function stopReplay() {
+    activeReplay = null;
+    state = 'idle';
+    showOverlay('NEON ARCADE', '选择游戏或点击开始游戏', '开始游戏', false);
+  }
+
+  function stepReplayAI() {
+    if (!activeReplay || !activeReplay.actions) { stopReplay(); return; }
+    const elapsed = Date.now() - replayStartAt;
+    while (replayCursor < activeReplay.actions.length && activeReplay.actions[replayCursor][0] <= elapsed) {
+      const act = activeReplay.actions[replayCursor];
+      const actionName = act[1];
+      if (activeGame === 'snake') {
+        if (actionName === 'up') snake.setDir(0, -1);
+        else if (actionName === 'down') snake.setDir(0, 1);
+        else if (actionName === 'left') snake.setDir(-1, 0);
+        else if (actionName === 'right') snake.setDir(1, 0);
+      } else if (activeGame === 'breakout') {
+        if (actionName === 'launch') breakout.launch();
+        else if (actionName === 'left') breakout.paddle.x = Math.max(0, breakout.paddle.x - 30);
+        else if (actionName === 'right') breakout.paddle.x = Math.min(canvas.width - breakout.paddle.w, breakout.paddle.x + 30);
+      } else if (activeGame === 'invaders') {
+        if (actionName === 'fire') invaders.fire();
+        else if (actionName === 'left') invaders.ship.x = Math.max(20, invaders.ship.x - 20);
+        else if (actionName === 'right') invaders.ship.x = Math.min(canvas.width - 20, invaders.ship.x + 20);
+      } else if (activeGame === 'runner') {
+        if (actionName === 'jump') runner.jump();
+        else if (actionName === 'slide') runner.slam(true);
+      }
+      replayCursor++;
+    }
+    if (replayCursor >= activeReplay.actions.length && elapsed > (activeReplay.durationMs || 10000)) {
+      stopReplay();
     }
   }
 
@@ -1487,6 +1584,8 @@
     scoreSubmitted = false;
     particles.length = 0;
     popups.length = 0;
+    activeReplay = null;
+    currentReplayActions = [];
     if (activeGame === 'snake') snake.reset();
     else if (activeGame === 'breakout') breakout.reset();
     else if (activeGame === 'invaders') invaders.reset();
@@ -1494,9 +1593,11 @@
     syncHud();
     if (autoStart) {
       state = 'playing';
+      gameStartTime = Date.now();
       hideOverlay();
     } else {
       state = 'idle';
+      gameStartTime = 0;
       if (activeGame === 'snake') {
         showOverlay('NEON SNAKE', '吃掉能量果实不断成长，连续进食触发 COMBO 连击，以太能量场提升水晶果概率！');
       } else if (activeGame === 'breakout') {
@@ -1547,6 +1648,8 @@
 
   pauseBtn.addEventListener('click', togglePause);
   restartBtn.addEventListener('click', () => resetCurrentGame(true));
+  if (replayBtn) replayBtn.addEventListener('click', () => playReplayForGame(activeGame));
+  if (demoPlayBtn) demoPlayBtn.addEventListener('click', () => playReplayForGame(activeGame));
   if (bgmBtn) bgmBtn.addEventListener('click', toggleBgm);
   if (fsBtn) fsBtn.addEventListener('click', toggleFullscreen);
   soundBtn.addEventListener('click', () => {
@@ -1571,33 +1674,36 @@
     if (k === 'm') { muted = !muted; soundBtn.textContent = muted ? '🔇' : '🔊'; return; }
     if (k === 'p') { togglePause(); return; }
     if (k === 'l') { boardBtn.click(); return; }
+    if (k === 'g') { playReplayForGame(activeGame); return; }
+    if (e.key === 'Escape' && state === 'replay') { stopReplay(); return; }
     if (k === 'r') { resetCurrentGame(true); return; }
     if (e.code === 'Space') {
       e.preventDefault();
+      if (state === 'replay') { stopReplay(); return; }
       if (state === 'idle' || state === 'over') { resetCurrentGame(true); return; }
       if (state === 'paused') { togglePause(); return; }
-      if (activeGame === 'breakout' && breakout.ball.stuck && state === 'playing') { breakout.launch(); return; }
-      if (activeGame === 'invaders' && state === 'playing') { invaders.ship.firing = true; invaders.fire(); return; }
-      if (activeGame === 'runner' && state === 'playing') { runner.jump(); return; }
+      if (activeGame === 'breakout' && breakout.ball.stuck && state === 'playing') { breakout.launch(); recordPlayerAction('launch'); return; }
+      if (activeGame === 'invaders' && state === 'playing') { invaders.ship.firing = true; invaders.fire(); recordPlayerAction('fire'); return; }
+      if (activeGame === 'runner' && state === 'playing') { runner.jump(); recordPlayerAction('jump'); return; }
       togglePause();
       return;
     }
     if (activeGame === 'snake') {
-      if (e.key === 'ArrowUp' || k === 'w') { e.preventDefault(); snake.setDir(0, -1); }
-      else if (e.key === 'ArrowDown' || k === 's') { e.preventDefault(); snake.setDir(0, 1); }
-      else if (e.key === 'ArrowLeft' || k === 'a') { e.preventDefault(); snake.setDir(-1, 0); }
-      else if (e.key === 'ArrowRight' || k === 'd') { e.preventDefault(); snake.setDir(1, 0); }
+      if (e.key === 'ArrowUp' || k === 'w') { e.preventDefault(); snake.setDir(0, -1); recordPlayerAction('up'); }
+      else if (e.key === 'ArrowDown' || k === 's') { e.preventDefault(); snake.setDir(0, 1); recordPlayerAction('down'); }
+      else if (e.key === 'ArrowLeft' || k === 'a') { e.preventDefault(); snake.setDir(-1, 0); recordPlayerAction('left'); }
+      else if (e.key === 'ArrowRight' || k === 'd') { e.preventDefault(); snake.setDir(1, 0); recordPlayerAction('right'); }
     } else if (activeGame === 'breakout') {
-      if (e.key === 'ArrowLeft' || k === 'a') breakout.paddle.moveLeft = true;
-      if (e.key === 'ArrowRight' || k === 'd') breakout.paddle.moveRight = true;
+      if (e.key === 'ArrowLeft' || k === 'a') { breakout.paddle.moveLeft = true; recordPlayerAction('left'); }
+      if (e.key === 'ArrowRight' || k === 'd') { breakout.paddle.moveRight = true; recordPlayerAction('right'); }
     } else if (activeGame === 'invaders') {
-      if (e.key === 'ArrowLeft' || k === 'a') invaders.ship.moveLeft = true;
-      if (e.key === 'ArrowRight' || k === 'd') invaders.ship.moveRight = true;
-      if (e.key === 'ArrowUp' || k === 'w') { e.preventDefault(); invaders.ship.firing = true; invaders.fire(); }
+      if (e.key === 'ArrowLeft' || k === 'a') { invaders.ship.moveLeft = true; recordPlayerAction('left'); }
+      if (e.key === 'ArrowRight' || k === 'd') { invaders.ship.moveRight = true; recordPlayerAction('right'); }
+      if (e.key === 'ArrowUp' || k === 'w') { e.preventDefault(); invaders.ship.firing = true; invaders.fire(); recordPlayerAction('fire'); }
     } else {
-      if (e.key === 'ArrowUp' || k === 'w') { e.preventDefault(); runner.jump(); }
-      else if (e.key === 'ArrowRight' || k === 'd') { e.preventDefault(); runner.dash(); }
-      else if (e.key === 'ArrowDown' || k === 's') { e.preventDefault(); runner.slam(true); }
+      if (e.key === 'ArrowUp' || k === 'w') { e.preventDefault(); runner.jump(); recordPlayerAction('jump'); }
+      else if (e.key === 'ArrowRight' || k === 'd') { e.preventDefault(); runner.dash(); recordPlayerAction('dash'); }
+      else if (e.key === 'ArrowDown' || k === 's') { e.preventDefault(); runner.slam(true); recordPlayerAction('slide'); }
     }
   });
 
@@ -1832,8 +1938,9 @@
 
     updateAndDrawStarfield();
 
-    if (state === 'playing' || state === 'idle') {
+    if (state === 'playing' || state === 'idle' || state === 'replay') {
       if (state === 'idle') stepAttractAI();
+      else if (state === 'replay') stepReplayAI();
       if (activeGame === 'snake') snake.step(dt);
       else if (activeGame === 'breakout') breakout.step();
       else if (activeGame === 'invaders') invaders.step();
@@ -1850,6 +1957,14 @@
       ctx.fillStyle = 'rgba(0, 245, 212, 0.72)';
       ctx.textAlign = 'left';
       ctx.fillText('● ATTRACT DEMO // AI 实机巡演中', 14, 22);
+    } else if (state === 'replay') {
+      const isBlink = Math.floor(now / 450) % 2 === 0;
+      ctx.font = 'bold 11px "JetBrains Mono", monospace';
+      ctx.fillStyle = isBlink ? 'rgba(255, 42, 133, 0.95)' : 'rgba(0, 245, 212, 0.95)';
+      ctx.textAlign = 'left';
+      const name = activeReplay ? activeReplay.name : 'GHOST';
+      const scoreVal = activeReplay ? activeReplay.score : 0;
+      ctx.fillText(`● GHOST REPLAY // [${name}] 高分 ${scoreVal} 分 [ESC 退出]`, 14, 22);
     }
 
     updateAndDrawEffects();

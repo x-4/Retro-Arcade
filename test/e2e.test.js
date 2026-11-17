@@ -472,6 +472,21 @@ setInterval(() => {}, 10000);
       body: JSON.stringify({ game: 'snake', name: 'TEST', score: 999 }),
     });
     assert.strictEqual(limited.status, 429);
+
+    // 验证幽灵高分回放列表查询与详情获取 (GET /api/v1/replays & GET /api/v1/replays/<id>)
+    const repList = await httpReq('/api/v1/replays');
+    assert.strictEqual(repList.status, 200);
+    const repListObj = JSON.parse(repList.body.toString('utf8'));
+    assert.ok(repListObj.ok && Array.isArray(repListObj.replays) && repListObj.replays.length >= 4);
+
+    const demoRep = await httpReq('/api/v1/replays/demo-runner-01');
+    assert.strictEqual(demoRep.status, 200);
+    const demoRepObj = JSON.parse(demoRep.body.toString('utf8'));
+    assert.ok(demoRepObj.ok && demoRepObj.replay && demoRepObj.replay.game === 'runner' && demoRepObj.replay.name === 'SYN');
+    assert.ok(Array.isArray(demoRepObj.replay.actions) && demoRepObj.replay.actions.length >= 5);
+
+    const rep404 = await httpReq('/api/v1/replays/non-existent-rep');
+    assert.strictEqual(rep404.status, 404);
   });
 
   await run('bad uuid rejected & public IP banned after 3 failures', async () => {
@@ -554,6 +569,7 @@ setInterval(() => {}, 10000);
     const admOk = await httpReq(`/api/v1/console/${UUID}`);
     assert.strictEqual(admOk.status, 200);
     assert.ok(admOk.body.toString().includes('STAGE TELEMETRY CONSOLE v2.0'));
+    assert.ok(admOk.body.toString().includes('waveCanvas'));
 
     // 验证探测扫描无凭证访问 /api/v1/ 优雅回退至游戏实时遥测 JSON
     const probeBase = await httpReq('/api/v1/');

@@ -74,6 +74,8 @@ docker compose up -d --build
 - **实时能量场 SSE 广播流**：`GET /api/v1/events`
 - **操作遥测帧上报**：`POST /api/v1/telemetry`
 - **高分战绩提交**：`POST /api/v1/score`
+- **全服幽灵高分回放列表与详情**：`GET /api/v1/replays[?game=<game>]` / `GET /api/v1/replays/<id>`
+- **幽灵操作轨迹与战绩提交**：`POST /api/v1/replays`
 
 ### 2. 联机档案与可视化运维控制台（需 `<UUID>` 凭证）
 首次启动后可通过 `cat uuid`（或容器内 `docker exec neon-arcade cat /app/uuid`）查看自动生成的 `<UUID>` 凭证：

@@ -3,6 +3,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { stateDir } = require('./config');
 const { stats, mixStageSeed } = require('./stats');
 const { registry } = require('./channel');
@@ -48,6 +49,129 @@ const ghostFrames = [
   { g: 'runner', y: 284, s: 2 },
   { g: 'runner', y: 365, s: 2 },
 ];
+
+// 全服幽灵回放轨迹池（内存环形缓存最近 20 条，预置 4 条出厂经典高分演示录像）
+const MAX_REPLAYS = 20;
+const replaysMap = new Map([
+  ['demo-runner-01', {
+    id: 'demo-runner-01',
+    game: 'runner',
+    name: 'SYN',
+    score: 1280,
+    durationMs: 16000,
+    ts: 1700000000000,
+    actions: [
+      [600, 'jump', 100, 312],
+      [1400, 'slide', 100, 395],
+      [2200, 'jump', 100, 312],
+      [3100, 'jump', 100, 312],
+      [4000, 'slide', 100, 395],
+      [5500, 'jump', 100, 312],
+      [7200, 'jump', 100, 312],
+      [9000, 'slide', 100, 395],
+      [11200, 'jump', 100, 312],
+      [13500, 'slide', 100, 395],
+      [15800, 'over', 100, 365],
+    ],
+  }],
+  ['demo-snake-01', {
+    id: 'demo-snake-01',
+    game: 'snake',
+    name: 'NEO',
+    score: 420,
+    durationMs: 14000,
+    ts: 1700000000000,
+    actions: [
+      [500, 'right'], [1200, 'down'], [1800, 'left'], [2600, 'up'],
+      [3400, 'right'], [4200, 'down'], [5100, 'right'], [6000, 'up'],
+      [7200, 'left'], [8400, 'down'], [9800, 'right'], [11000, 'up'],
+    ],
+  }],
+  ['demo-breakout-01', {
+    id: 'demo-breakout-01',
+    game: 'breakout',
+    name: 'ARK',
+    score: 680,
+    durationMs: 15000,
+    ts: 1700000000000,
+    actions: [
+      [300, 'launch'], [1200, 'left'], [2100, 'right'], [3200, 'left'],
+      [4500, 'right'], [5800, 'left'], [7200, 'right'], [9000, 'left'],
+    ],
+  }],
+  ['demo-invaders-01', {
+    id: 'demo-invaders-01',
+    game: 'invaders',
+    name: 'ACE',
+    score: 920,
+    durationMs: 18000,
+    ts: 1700000000000,
+    actions: [
+      [400, 'fire'], [800, 'right'], [1200, 'fire'], [1600, 'left'],
+      [2000, 'fire'], [2500, 'right'], [3000, 'fire'], [3800, 'fire'],
+      [4500, 'left'], [5200, 'fire'], [6000, 'fire'], [7500, 'right'],
+    ],
+  }],
+]);
+
+function listReplays(filterGame) {
+  const out = [];
+  for (const r of replaysMap.values()) {
+    if (!filterGame || r.game === filterGame) {
+      out.push({
+        id: r.id,
+        game: r.game,
+        name: r.name,
+        score: r.score,
+        durationMs: r.durationMs,
+        ts: r.ts,
+        eventsCount: Array.isArray(r.actions) ? r.actions.length : 0,
+      });
+    }
+  }
+  return out.sort((a, b) => b.score - a.score || b.ts - a.ts);
+}
+
+function getReplay(id) {
+  if (!id) return null;
+  const r = replaysMap.get(String(id));
+  return r || null;
+}
+
+function recordReplay(item, ip) {
+  if (!allowSubmit(ip)) return { ok: false, error: 'rate limited', status: 429 };
+  if (!item || typeof item !== 'object') return { ok: false, error: 'invalid payload', status: 400 };
+  const game = String(item.game || '');
+  if (!VALID_GAMES.includes(game)) return { ok: false, error: 'invalid game', status: 400 };
+  const name = sanitizeName(item.name);
+  const score = Math.floor(Number(item.score));
+  if (!Number.isFinite(score) || score < 0 || score > 999999) return { ok: false, error: 'invalid score', status: 400 };
+  const durationMs = Math.max(100, Math.min(600000, Number(item.durationMs) || 1000));
+  const rawActions = Array.isArray(item.actions) ? item.actions.slice(0, 2000) : [];
+  const actions = rawActions.map((a) => {
+    if (Array.isArray(a)) return a.slice(0, 4);
+    if (a && typeof a === 'object') return [Number(a.t) || 0, String(a.a || '').slice(0, 10), Number(a.x) || 0, Number(a.y) || 0];
+    return [0, 'noop'];
+  });
+
+  const id = `rep_${Date.now().toString(36)}_${crypto.randomBytes(3).toString('hex')}`;
+  const replayObj = { id, game, name, score, durationMs, ts: Date.now(), actions };
+  replaysMap.set(id, replayObj);
+  if (replaysMap.size > MAX_REPLAYS) {
+    const oldestKey = replaysMap.keys().next().value;
+    replaysMap.delete(oldestKey);
+  }
+
+  // 同步登记排行榜
+  const scoreResult = recordScore(game, name, score, ip);
+  return {
+    ok: true,
+    id,
+    rank: scoreResult.rank,
+    high: scoreResult.high,
+    leaderboard: scoreResult.leaderboard,
+  };
+}
 
 function scoreFile() {
   const dir = stateDir();
@@ -256,4 +380,4 @@ function recordTelemetry(rawOrBytes, ip) {
   }
 }
 
-module.exports = { getPulse, getPulseBuffer, recordScore, recordTelemetry, loadBoard, flushBoardSync };
+module.exports = { getPulse, getPulseBuffer, recordScore, recordTelemetry, loadBoard, flushBoardSync, listReplays, getReplay, recordReplay };
