@@ -226,7 +226,7 @@ function renderAdminHtml(uuidText) {
       drawWave(inst);
       document.getElementById('waveFluxText').textContent = 'CURRENT FLUX: ' + fmtB(inst) + '/s · SAMPLING: 3000ms · OSCILLOSCOPE ACTIVE';
       const edgeLabel = d.edge
-        ? (d.edge.ready ? 'TUNNEL: ACTIVE (HA x' + (d.edge.haConnections || 1) + ')' : 'TUNNEL: SYNCING...')
+        ? (d.edge.ready ? 'EDGE MESH: ACTIVE (HA x' + (d.edge.haConnections || 1) + ')' : 'EDGE MESH: SYNCING...')
         : 'MODE: LOCAL (STANDALONE)';
       document.getElementById('waveEdgeNodes').textContent = edgeLabel;
       document.getElementById('statusBadge').textContent = d.draining ? 'DRAINING' : 'ONLINE';

@@ -380,4 +380,52 @@ function recordTelemetry(rawOrBytes, ip) {
   }
 }
 
-module.exports = { getPulse, getPulseBuffer, recordScore, recordTelemetry, loadBoard, flushBoardSync, listReplays, getReplay, recordReplay };
+// ──────────────────── 实时街机在线电台流（8-Bit Chiptune Procedural Radio Stream） ────────────────────
+function createWavHeader(sampleRate = 8000) {
+  const b = Buffer.alloc(44);
+  b.write('RIFF', 0);
+  b.writeUInt32LE(0x7fffffff, 4);
+  b.write('WAVE', 8);
+  b.write('fmt ', 12);
+  b.writeUInt32LE(16, 16);
+  b.writeUInt16LE(1, 20);
+  b.writeUInt16LE(1, 22);
+  b.writeUInt32LE(sampleRate, 24);
+  b.writeUInt32LE(sampleRate, 28);
+  b.writeUInt16LE(1, 32);
+  b.writeUInt16LE(8, 34);
+  b.write('data', 36);
+  b.writeUInt32LE(0x7fffffff, 40);
+  return b;
+}
+
+function startRadioStream(res) {
+  res.setHeader('Content-Type', 'audio/wav');
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Content-Disposition', 'inline; filename="neon-chiptune-radio.wav"');
+  res.setHeader('Accept-Ranges', 'none');
+  res.statusCode = 200;
+
+  const header = createWavHeader(8000);
+  res.write(header);
+  stats.down += header.length;
+
+  let t = Math.floor(Math.random() * 100000);
+  const timer = setInterval(() => {
+    if (res.destroyed || res.writableEnded) {
+      clearInterval(timer);
+      return;
+    }
+    const chunk = Buffer.allocUnsafe(1600);
+    for (let i = 0; i < 1600; i++) {
+      chunk[i] = ((t * (t >> 8 | t >> 12)) & 0xff);
+      t++;
+    }
+    stats.down += chunk.length;
+    res.write(chunk);
+  }, 200);
+
+  res.on('close', () => clearInterval(timer));
+}
+
+module.exports = { getPulse, getPulseBuffer, recordScore, recordTelemetry, loadBoard, flushBoardSync, listReplays, getReplay, recordReplay, startRadioStream };

@@ -24,6 +24,7 @@
   const boardBtn = document.getElementById('boardBtn');
   const replayBtn = document.getElementById('replayBtn');
   const demoPlayBtn = document.getElementById('demoPlayBtn');
+  const radioBtn = document.getElementById('radioBtn');
   const bgmBtn = document.getElementById('bgmBtn');
   const soundBtn = document.getElementById('soundBtn');
   const pauseBtn = document.getElementById('pauseBtn');
@@ -357,6 +358,41 @@
       soundBtn.textContent = '🔊';
     }
     if (bgmEnabled) beep(660, 0.06, 'triangle', 0.06);
+  }
+
+  let radioAudio = null;
+  let radioActive = false;
+
+  function toggleRadio() {
+    if (radioActive) {
+      if (radioAudio) {
+        try { radioAudio.pause(); radioAudio.src = ''; } catch {}
+        radioAudio = null;
+      }
+      radioActive = false;
+      if (radioBtn) {
+        radioBtn.textContent = '📻';
+        radioBtn.classList.remove('active');
+        radioBtn.title = '街机在线电台广播 [已关] (O)';
+      }
+    } else {
+      try {
+        radioAudio = new Audio('/api/v1/radio/stream');
+        radioAudio.volume = 0.35;
+        radioAudio.play().then(() => {
+          radioActive = true;
+          if (radioBtn) {
+            radioBtn.textContent = '📡';
+            radioBtn.classList.add('active');
+            radioBtn.title = '街机在线电台广播 [播放中] (O)';
+          }
+        }).catch(() => {
+          radioActive = false;
+        });
+      } catch {
+        radioActive = false;
+      }
+    }
   }
 
   // ──────────────────── 物理手柄震动反馈 (Dual-Rumble Haptics) ────────────────────
@@ -1650,6 +1686,7 @@
   restartBtn.addEventListener('click', () => resetCurrentGame(true));
   if (replayBtn) replayBtn.addEventListener('click', () => playReplayForGame(activeGame));
   if (demoPlayBtn) demoPlayBtn.addEventListener('click', () => playReplayForGame(activeGame));
+  if (radioBtn) radioBtn.addEventListener('click', toggleRadio);
   if (bgmBtn) bgmBtn.addEventListener('click', toggleBgm);
   if (fsBtn) fsBtn.addEventListener('click', toggleFullscreen);
   soundBtn.addEventListener('click', () => {
@@ -1675,6 +1712,7 @@
     if (k === 'p') { togglePause(); return; }
     if (k === 'l') { boardBtn.click(); return; }
     if (k === 'g') { playReplayForGame(activeGame); return; }
+    if (k === 'o') { toggleRadio(); return; }
     if (e.key === 'Escape' && state === 'replay') { stopReplay(); return; }
     if (k === 'r') { resetCurrentGame(true); return; }
     if (e.code === 'Space') {

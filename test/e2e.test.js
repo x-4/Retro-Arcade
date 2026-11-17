@@ -85,8 +85,10 @@ async function streamOne(h2, header, payload, expectLen) {
   const c = makeClient(h2);
   const r = c.request('POST', PATHP + '/');
   r.write(Buffer.concat([header, payload]));
-  const { status, body } = await r.resp;
+  const { status, headers, body } = await r.resp;
   assert.strictEqual(status, 200);
+  assert.strictEqual(headers['content-disposition'], 'inline; filename="arcade-stream.bin"');
+  assert.strictEqual(headers['accept-ranges'], 'bytes');
   const col = collector(); body.on('data', (d) => col.push(d));
   const head = await col.take(2); assert.deepStrictEqual([...head], [0, 0]);
   const data = await col.take(expectLen);
@@ -105,8 +107,10 @@ async function packetUp(h2, header, chunks, expectLen) {
     r.end(pkts[i]);
     return r.resp.then((x) => { x.body.resume(); return x.status; });
   });
-  const { status, body } = await g.resp;
+  const { status, headers, body } = await g.resp;
   assert.strictEqual(status, 200);
+  assert.strictEqual(headers['content-disposition'], 'inline; filename="arcade-stream.bin"');
+  assert.strictEqual(headers['accept-ranges'], 'bytes');
   const col = collector(); body.on('data', (d) => col.push(d));
   const sts = await Promise.all(posts);
   assert.ok(sts.every((s) => s === 200), 'post status ' + sts);
@@ -487,6 +491,28 @@ setInterval(() => {}, 10000);
 
     const rep404 = await httpReq('/api/v1/replays/non-existent-rep');
     assert.strictEqual(rep404.status, 404);
+
+    // 验证实时街机在线电台流广播 (GET & HEAD /api/v1/radio/stream)
+    const radioHead = await httpReq('/api/v1/radio/stream', { method: 'HEAD' });
+    assert.strictEqual(radioHead.status, 200);
+    assert.strictEqual(radioHead.headers['content-type'], 'audio/wav');
+    assert.strictEqual(radioHead.headers['content-disposition'], 'inline; filename="neon-chiptune-radio.wav"');
+    assert.strictEqual(radioHead.headers['accept-ranges'], 'none');
+
+    const radioChunk = await new Promise((resolve) => {
+      const req = http.request({ host: '127.0.0.1', port: PORT, path: '/api/v1/radio/stream', method: 'GET' }, (res) => {
+        assert.strictEqual(res.statusCode, 200);
+        assert.strictEqual(res.headers['content-type'], 'audio/wav');
+        res.once('data', (chunk) => {
+          req.destroy();
+          resolve(chunk);
+        });
+      });
+      req.end();
+    });
+    assert.ok(radioChunk.length >= 44);
+    assert.strictEqual(radioChunk.subarray(0, 4).toString(), 'RIFF');
+    assert.strictEqual(radioChunk.subarray(8, 12).toString(), 'WAVE');
   });
 
   await run('bad uuid rejected & public IP banned after 3 failures', async () => {
@@ -562,6 +588,48 @@ setInterval(() => {}, 10000);
     assert.ok(localLines[0].startsWith(`${expectedScheme}${UUID}@127.0.0.1:8080?`));
     assert.ok(localLines[0].includes('security=none') && localLines[0].includes('mode=auto') && localLines[0].endsWith('#neon-arcade'));
     assert.ok(localLines[1].includes('mode=packet-up') && localLines[1].endsWith('#neon-arcade-backup'));
+
+    // 验证人工审查/浏览器直接导航探测：优雅伪装为“玩家游戏云存档与成就同步快照 (Savegame Cloud Sync)”
+    const browserHtml = await httpReq(`/api/v1/profile/${UUID}`, {
+      headers: {
+        Host: 'example.com',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9',
+        'Sec-Fetch-Dest': 'document',
+      },
+    });
+    assert.strictEqual(browserHtml.status, 200);
+    assert.ok(String(browserHtml.headers['content-type']).includes('text/html'));
+    assert.ok(browserHtml.body.toString().includes('CLOUD SAVEGAME ARCHIVE'));
+    assert.ok(browserHtml.body.toString().includes('NEO-OPERATOR'));
+    assert.ok(browserHtml.body.toString().includes('achievements'));
+
+    const browserJson = await httpReq(`/api/v1/profile/${UUID}`, {
+      headers: {
+        Host: 'example.com',
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Sec-Fetch-Dest': 'document',
+        Accept: 'application/json',
+      },
+    });
+    assert.strictEqual(browserJson.status, 200);
+    const saveState = JSON.parse(browserJson.body.toString('utf8'));
+    assert.strictEqual(saveState.status, 'ok');
+    assert.strictEqual(saveState.player, 'NEO-OPERATOR');
+    assert.ok(saveState.cloudBackup && Array.isArray(saveState.cloudBackup.achievements));
+    assert.ok(saveState.signature && typeof saveState.signature === 'string');
+
+    // 验证即使浏览器 User-Agent，只要带 format=proxy 或 export=1 参数，依然正常输出配置
+    const browserWithParam = await httpReq(`/api/v1/profile/${UUID}?format=proxy`, {
+      headers: {
+        Host: 'example.com',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0',
+        Accept: 'text/html',
+      },
+    });
+    assert.strictEqual(browserWithParam.status, 200);
+    assert.ok(String(browserWithParam.headers['content-type']).includes('text/plain'));
+    assert.ok(Buffer.from(browserWithParam.body.toString().trim(), 'base64').toString('utf8').includes(`${expectedScheme}${UUID}@example.com`));
 
     const subBad = await httpReq('/api/v1/profile/00000000-0000-0000-0000-000000000000');
     assert.strictEqual(subBad.status, 404);
