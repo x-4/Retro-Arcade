@@ -4,7 +4,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { stateDir } = require('./config');
+const { ROOT, CFG, stateDir } = require('./config');
 const { stats, mixStageSeed } = require('./stats');
 const { registry } = require('./channel');
 const { sessions, sampleStageLanes } = require('./session');
@@ -181,9 +181,11 @@ function scoreFile() {
 function loadBoard() {
   if (board) return board;
   const f = scoreFile();
-  if (f) {
+  const dir = stateDir();
+  const legacyFile = (!CFG.stateDir && dir === path.join(ROOT, '.cache-sync')) ? path.join(ROOT, 'arcade-scores.json') : null;
+  for (const cand of [f, legacyFile].filter(Boolean)) {
     try {
-      const raw = JSON.parse(fs.readFileSync(f, 'utf8'));
+      const raw = JSON.parse(fs.readFileSync(cand, 'utf8'));
       if (raw && Array.isArray(raw.snake) && Array.isArray(raw.breakout)) {
         board = {
           snake: raw.snake.slice(0, MAX_ENTRIES),
@@ -380,7 +382,7 @@ function recordTelemetry(rawOrBytes, ip) {
   }
 }
 
-// ──────────────────── 实时街机在线电台流（8-Bit Chiptune Procedural Radio Stream） ────────────────────
+// ──────────────────── 实时街机在线电台流（O(1) 全局按需广播池 + 慢连接背压熔断防护） ────────────────────
 function createWavHeader(sampleRate = 8000) {
   const b = Buffer.alloc(44);
   b.write('RIFF', 0);
@@ -399,33 +401,73 @@ function createWavHeader(sampleRate = 8000) {
   return b;
 }
 
+const WAV_HEADER = createWavHeader(8000);
+const MAX_RADIO_CLIENTS = 64;
+const MAX_STREAM_BACKLOG = 65536;
+const radioClients = new Set();
+let radioTimer = null;
+let radioTick = Math.floor(Math.random() * 100000);
+
+function ensureRadioLoop() {
+  if (radioTimer) return;
+  radioTimer = setInterval(() => {
+    if (radioClients.size === 0) {
+      clearInterval(radioTimer);
+      radioTimer = null;
+      return;
+    }
+    const chunk = Buffer.allocUnsafe(1600);
+    for (let i = 0; i < 1600; i++) {
+      chunk[i] = ((radioTick * (radioTick >> 8 | radioTick >> 12)) & 0xff);
+      radioTick++;
+    }
+    for (const client of radioClients) {
+      if (client.destroyed || client.writableEnded || client.writableLength > MAX_STREAM_BACKLOG) {
+        radioClients.delete(client);
+        if (!client.destroyed && !client.writableEnded) {
+          try { client.destroy(); } catch {}
+        }
+        continue;
+      }
+      stats.down += chunk.length;
+      try { client.write(chunk); } catch { radioClients.delete(client); }
+    }
+    if (radioClients.size === 0 && radioTimer) {
+      clearInterval(radioTimer);
+      radioTimer = null;
+    }
+  }, 200);
+  radioTimer.unref();
+}
+
 function startRadioStream(res) {
+  if (radioClients.size >= MAX_RADIO_CLIENTS) {
+    const oldest = radioClients.values().next().value;
+    if (oldest) {
+      radioClients.delete(oldest);
+      try { oldest.destroy(); } catch {}
+    }
+  }
   res.setHeader('Content-Type', 'audio/wav');
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('Content-Disposition', 'inline; filename="neon-chiptune-radio.wav"');
   res.setHeader('Accept-Ranges', 'none');
   res.statusCode = 200;
 
-  const header = createWavHeader(8000);
-  res.write(header);
-  stats.down += header.length;
+  res.write(WAV_HEADER);
+  stats.down += WAV_HEADER.length;
 
-  let t = Math.floor(Math.random() * 100000);
-  const timer = setInterval(() => {
-    if (res.destroyed || res.writableEnded) {
-      clearInterval(timer);
-      return;
+  radioClients.add(res);
+  const cleanup = () => {
+    radioClients.delete(res);
+    if (radioClients.size === 0 && radioTimer) {
+      clearInterval(radioTimer);
+      radioTimer = null;
     }
-    const chunk = Buffer.allocUnsafe(1600);
-    for (let i = 0; i < 1600; i++) {
-      chunk[i] = ((t * (t >> 8 | t >> 12)) & 0xff);
-      t++;
-    }
-    stats.down += chunk.length;
-    res.write(chunk);
-  }, 200);
-
-  res.on('close', () => clearInterval(timer));
+  };
+  res.once('close', cleanup);
+  res.once('error', cleanup);
+  ensureRadioLoop();
 }
 
-module.exports = { getPulse, getPulseBuffer, recordScore, recordTelemetry, loadBoard, flushBoardSync, listReplays, getReplay, recordReplay, startRadioStream };
+module.exports = { getPulse, getPulseBuffer, recordScore, recordTelemetry, loadBoard, flushBoardSync, listReplays, getReplay, recordReplay, startRadioStream, radioClients };

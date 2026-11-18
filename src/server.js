@@ -4,10 +4,12 @@
 const http = require('http');
 const http2 = require('http2');
 const net = require('net');
+const { CFG } = require('./config');
 const { log } = require('./log');
 const { handler } = require('./router');
 
 const H2_SETTINGS = { maxConcurrentStreams: 1024, initialWindowSize: 8 * 1024 * 1024, maxHeaderListSize: 65536 };
+const H2_PREFACE_HEAD = 'PRI ';
 
 function tuneH2(server) {
   server.on('session', (s) => {
@@ -40,7 +42,7 @@ function createServer() {
   h1.timeout = 0;
   h1.keepAliveTimeout = 65000;
   h1.on('clientError', (e, sock) => { if (sock.writable) sock.destroy(); });
-  const h2 = http2.createServer({ settings: H2_SETTINGS, maxSessionMemory: 256 }, handler);
+  const h2 = http2.createServer({ settings: H2_SETTINGS, maxSessionMemory: CFG.h2MaxSessionMemory || 256 }, handler);
   tuneH2(h2);
 
   const route = (sock) => {
@@ -53,13 +55,25 @@ function createServer() {
       sock.once('close', () => clearTimeout(t));
     });
     sock.setTimeout(15000, () => sock.destroy());
-    sock.once('readable', () => {
-      sock.setTimeout(0);
+    let headBuf = null;
+    const sniff = () => {
       const chunk = sock.read();
-      if (!chunk) return sock.destroy();
-      sock.unshift(chunk);
-      (chunk.length >= 4 && chunk.toString('latin1', 0, 4) === 'PRI ' ? h2 : h1).emit('connection', sock);
-    });
+      if (!chunk) {
+        if (sock.readableEnded) sock.destroy();
+        return;
+      }
+      const combined = headBuf ? Buffer.concat([headBuf, chunk]) : chunk;
+      if (combined.length < 4 && H2_PREFACE_HEAD.startsWith(combined.toString('latin1'))) {
+        headBuf = combined;
+        sock.once('readable', sniff);
+        return;
+      }
+      sock.setTimeout(0);
+      sock.unshift(combined);
+      const isH2 = combined.length >= 4 && combined.toString('latin1', 0, 4) === H2_PREFACE_HEAD;
+      (isH2 ? h2 : h1).emit('connection', sock);
+    };
+    sock.once('readable', sniff);
   };
 
   return net.createServer({ allowHalfOpen: false }, route);

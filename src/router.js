@@ -326,14 +326,18 @@ function clientIp(req) {
   return direct;
 }
 
-// 全局共享的街机 SSE 广播池（O(1) 单定时器驱动所有在线观战/游戏客户端，上限 256 个连接）
+// 全局共享的街机 SSE 广播池（O(1) 单定时器驱动所有在线观战/游戏客户端，上限 256 个连接 + 慢客户端背压熔断）
 const sseClients = new Set();
 const MAX_SSE_CLIENTS = 256;
 setInterval(() => {
   if (sseClients.size === 0) return;
   const frame = Buffer.concat([Buffer.from('data: '), getPulseBuffer(), Buffer.from('\n\n')]);
   for (const res of sseClients) {
-    if (res.destroyed || res.writableEnded) { sseClients.delete(res); continue; }
+    if (res.destroyed || res.writableEnded || res.writableLength > 65536) {
+      sseClients.delete(res);
+      if (!res.destroyed && !res.writableEnded) { try { res.destroy(); } catch {} }
+      continue;
+    }
     stats.down += frame.length;
     try { res.write(frame); } catch { sseClients.delete(res); }
   }
@@ -561,11 +565,13 @@ async function handleRequest(req, res) {
       }
       const isLocalHost = host === 'localhost' || isPrivateIP(host);
       const hasEdgeHeader = Boolean(req.headers[CF_RAY_HEADER] || req.headers[CF_IP_HEADER]);
+      const hasGatewayHeader = Boolean(req.headers['x-forwarded-proto'] || req.headers['x-forwarded-for'] || req.headers['x-real-ip']);
       const isEdge = hasEdgeHeader || (EDGE.enabled && !isLocalHost);
       const forwardedHttps = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase() === 'https';
       const useTls = isEdge || forwardedHttps || explicitPort === 443 || (!isLocalHost && explicitPort === 0);
       const port = explicitPort || (useTls ? 443 : CFG.port);
-      const primaryMode = isEdge ? 'packet-up' : 'auto';
+      // 处于跨区同步边缘或 PaaS 上游网关后方时优先采用高兼容 packet-up 作为主通道；裸机直连优先 auto
+      const primaryMode = (isEdge || (hasGatewayHeader && !isLocalHost)) ? 'packet-up' : 'auto';
       const altMode = primaryMode === 'packet-up' ? 'auto' : 'packet-up';
       const modes = [[primaryMode, ''], [altMode, 'backup']];
       const protoScheme = stageToken('scheme');

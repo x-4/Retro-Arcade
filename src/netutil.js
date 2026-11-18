@@ -236,7 +236,7 @@ function waitDrain(sock) {
 }
 
 // ───────────────────────────── 加密 DNS (DoH) 多服务源并发优选与双栈 SWR 缓存池 ─────────────────────────────
-const dohAgent = new https.Agent({ keepAlive: true, maxSockets: 16, maxFreeSockets: 8, timeout: 5000 });
+const dohAgent = new https.Agent({ keepAlive: true, maxSockets: 64, maxFreeSockets: 16, timeout: 5000 });
 process.on('exit', () => dohAgent.destroy());
 const CF_DOH_HOST = Buffer.from('Y2xvdWRmbGFyZS1kbnMuY29t', 'base64').toString('utf8');
 
@@ -273,6 +273,7 @@ function queryDohSingle(prov, host, type) {
             if (a.type === 1 && net.isIPv4(a.data)) list.push({ address: a.data, family: 4 });
             else if (a.type === 28 && net.isIPv6(a.data)) list.push({ address: a.data, family: 6 });
           }
+          list.rcode = json && typeof json.Status === 'number' ? json.Status : -1;
           resolve(list);
         } catch (e) {
           reject(e);
@@ -295,10 +296,15 @@ function queryDohMulti(host) {
     let inFlight = 0;
     const order = [preferredDohIdx, ...DOH_PROVIDERS.map((_, i) => i).filter((i) => i !== preferredDohIdx)];
     let idx = 0;
-    let staggerTimer = null;
+    const staggerTimers = new Set();
 
     const cleanup = () => {
-      if (staggerTimer) { clearTimeout(staggerTimer); staggerTimer = null; }
+      for (const t of staggerTimers) clearTimeout(t);
+      staggerTimers.clear();
+    };
+
+    const fallbackLocalDns = () => {
+      dns.promises.lookup(host, { all: true }).then(resolve).catch(reject);
     };
 
     const tryNext = () => {
@@ -314,8 +320,12 @@ function queryDohMulti(host) {
         inFlight--;
         if (settled) return;
         const list = [];
+        let nxdomainCount = 0;
         for (const r of results) {
-          if (r.status === 'fulfilled' && Array.isArray(r.value)) list.push(...r.value);
+          if (r.status === 'fulfilled' && Array.isArray(r.value)) {
+            list.push(...r.value);
+            if (r.value.rcode === 3) nxdomainCount++;
+          }
         }
         if (list.length > 0) {
           settled = true;
@@ -324,12 +334,19 @@ function queryDohMulti(host) {
           resolve(list);
           return;
         }
+        // 权威 NXDOMAIN (Status === 3) 快速短路：无需继续轮询其余 5 组 DoH 源（消除 12 倍请求放大），仅做一次本地 /etc/hosts 兜底
+        if (nxdomainCount === results.length) {
+          settled = true;
+          cleanup();
+          fallbackLocalDns();
+          return;
+        }
         if (idx < order.length) {
           tryNext();
         } else if (inFlight === 0) {
           settled = true;
           cleanup();
-          dns.promises.lookup(host, { all: true }).then(resolve).catch(reject);
+          fallbackLocalDns();
         }
       }).catch(() => {
         inFlight--;
@@ -339,13 +356,17 @@ function queryDohMulti(host) {
         } else if (inFlight === 0) {
           settled = true;
           cleanup();
-          dns.promises.lookup(host, { all: true }).then(resolve).catch(reject);
+          fallbackLocalDns();
         }
       });
 
       if (idx < order.length && !settled) {
-        staggerTimer = setTimeout(tryNext, 250);
-        staggerTimer.unref();
+        const t = setTimeout(() => {
+          staggerTimers.delete(t);
+          tryNext();
+        }, 250);
+        t.unref();
+        staggerTimers.add(t);
       }
     };
 

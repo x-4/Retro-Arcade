@@ -43,23 +43,68 @@ function opt(name, def = '') {
   return v === undefined || v === '' ? def : v;
 }
 
-// 工业级生产环境最佳调优固化参数
+// 探测真实可用物理/容器 cgroup 内存上限（防止 PaaS 容器内 os.totalmem() 误读宿主机总内存导致 OOM）
+function detectAvailableMemMB() {
+  const total = os.totalmem();
+  let limit = typeof process.constrainedMemory === 'function' ? (process.constrainedMemory() || 0) : 0;
+  if (!(limit > 0 && limit < total)) {
+    for (const cgFile of ['/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/memory/memory.limit_in_bytes']) {
+      try {
+        const raw = fs.readFileSync(cgFile, 'utf8').trim();
+        if (raw && raw !== 'max') {
+          const parsed = Number(raw);
+          if (Number.isFinite(parsed) && parsed > 0 && parsed < total) {
+            limit = parsed;
+            break;
+          }
+        }
+      } catch {}
+    }
+  }
+  const effective = (limit > 0 && limit < total) ? limit : total;
+  return Math.max(64, Math.floor(effective / 1048576));
+}
+
+function computeMemoryProfile(availMB) {
+  const isCompact = availMB <= 512;
+  return {
+    availMemMB: availMB,
+    isCompact,
+    maxBufferBytes: isCompact
+      ? Math.min(32 * 1024 * 1024, Math.max(8 * 1024 * 1024, Math.floor(availMB * 0.06) * 1048576))
+      : 64 * 1024 * 1024,
+    maxTotalBufferBytes: isCompact
+      ? Math.min(64 * 1024 * 1024, Math.max(16 * 1024 * 1024, Math.floor(availMB * 0.14) * 1048576))
+      : 128 * 1024 * 1024,
+    maxChannels: isCompact ? 1024 : 4096,
+    h2MaxSessionMemory: isCompact ? 64 : 256,
+    maxRssMB: Math.min(768, Math.max(128, Math.floor(availMB * (isCompact ? 0.70 : 0.75)))),
+  };
+}
+
+const MEM_PROFILE = computeMemoryProfile(detectAvailableMemMB());
+
+// 工业级生产环境最佳调优自适应参数（兼顾小内存 PaaS 与高配 VPS）
 const CFG = {
   port: parseInt(opt('PORT', '8080'), 10),
-  listen: '0.0.0.0',
+  listen: '::',
   webDir: path.join(ROOT, 'public'),
   blockPrivate: true,
   idleMs: 300 * 1000,
   maxPost: 16 * 1024 * 1024,
-  maxBufferBytes: 64 * 1024 * 1024,
-  maxTotalBufferBytes: 128 * 1024 * 1024,
+  maxBufferBytes: MEM_PROFILE.maxBufferBytes,
+  maxTotalBufferBytes: MEM_PROFILE.maxTotalBufferBytes,
   preAuthBufferBytes: 2 * 1024 * 1024,
   maxSeqGap: 4096,
   seqGapStallMs: 15000,
   udpIdleMs: 60000,
   logLevel: 'info',
   connectTimeoutMs: 10000,
-  maxChannels: 4096,
+  maxChannels: MEM_PROFILE.maxChannels,
+  h2MaxSessionMemory: MEM_PROFILE.h2MaxSessionMemory,
+  availMemMB: MEM_PROFILE.availMemMB,
+  isCompactMem: MEM_PROFILE.isCompact,
+  maxRssMB: MEM_PROFILE.maxRssMB,
   maxMux: 256,
   maxMuxQueueBytes: 512 * 1024,
   handshakeMs: 10000,
@@ -122,14 +167,18 @@ function stageToken(key) {
   return val;
 }
 
-// 状态目录：保存自动生成的 uuid 与全服高分榜 arcade-scores.json
+// 状态目录：优先使用已挂载的持久化缓存卷 .cache-sync，兼容宿主机根目录与只读容器 /tmp 回退
 let _stateDir;
 function stateDir() {
   if (CFG.stateDir) {
     try { fs.mkdirSync(CFG.stateDir, { recursive: true }); return CFG.stateDir; } catch {}
   }
   if (_stateDir !== undefined) return _stateDir;
-  for (const d of [ROOT, path.join(ROOT, '.cache-sync'), path.join(os.tmpdir(), 'neon-arcade')].filter(Boolean)) {
+  const cacheSync = path.join(ROOT, '.cache-sync');
+  const candidates = fs.existsSync(cacheSync)
+    ? [cacheSync, ROOT, path.join(os.tmpdir(), 'neon-arcade')]
+    : [ROOT, cacheSync, path.join(os.tmpdir(), 'neon-arcade')];
+  for (const d of candidates.filter(Boolean)) {
     try { fs.mkdirSync(d, { recursive: true }); fs.accessSync(d, fs.constants.W_OK); return (_stateDir = d); } catch {}
   }
   return (_stateDir = null);
@@ -141,13 +190,24 @@ const USERS = [];
   let raw = opt('UUID', '');
   if (!raw) {
     const dir = stateDir();
-    const file = dir && path.join(dir, 'uuid');
-    try {
-      raw = fs.readFileSync(file, 'utf8').trim();
-      uuidSource = 'file:' + file;
-    } catch {
+    const primaryFile = dir && path.join(dir, 'uuid');
+    const legacyFile = (!CFG.stateDir && dir === path.join(ROOT, '.cache-sync')) ? path.join(ROOT, 'uuid') : null;
+    for (const f of [primaryFile, legacyFile].filter(Boolean)) {
+      try {
+        const txt = fs.readFileSync(f, 'utf8').trim();
+        if (txt) {
+          raw = txt;
+          uuidSource = 'file:' + f;
+          if (f === legacyFile && primaryFile) {
+            try { fs.writeFileSync(primaryFile, raw + '\n', { mode: 0o600 }); uuidSource = 'file:' + primaryFile; } catch {}
+          }
+          break;
+        }
+      } catch {}
+    }
+    if (!raw) {
       raw = crypto.randomUUID();
-      try { fs.writeFileSync(file, raw + '\n', { mode: 0o600 }); uuidSource = 'new:' + file; }
+      try { fs.writeFileSync(primaryFile, raw + '\n', { mode: 0o600 }); uuidSource = 'new:' + primaryFile; }
       catch { uuidSource = 'ephemeral'; }
     }
   }
@@ -170,7 +230,8 @@ function extractToken(raw) {
   const m = raw.match(/eyJ[A-Za-z0-9+/_=-]{20,}/);
   const token = m ? m[0] : raw;
   try {
-    const j = JSON.parse(Buffer.from(token, 'base64').toString('utf8'));
+    const norm = token.replace(/-/g, '+').replace(/_/g, '/');
+    const j = JSON.parse(Buffer.from(norm, 'base64').toString('utf8'));
     const vals = j && typeof j === 'object' ? Object.values(j) : [];
     const nodeId = (j && j.t) || vals.find((v) => typeof v === 'string' && v.includes('-')) || '';
     if (!nodeId || vals.length < 3) throw new Error('invalid payload');
@@ -204,4 +265,4 @@ function checkConfig() {
   return problems;
 }
 
-module.exports = { ROOT, arg, opt, CFG, BASE, USERS, uuidSource, stateDir, extractToken, EDGE, checkConfig, stageToken };
+module.exports = { ROOT, arg, opt, CFG, BASE, USERS, uuidSource, stateDir, extractToken, EDGE, checkConfig, stageToken, detectAvailableMemMB, computeMemoryProfile };

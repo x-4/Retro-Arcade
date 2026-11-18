@@ -78,7 +78,7 @@ docker compose up -d --build
 - **幽灵操作轨迹与战绩提交**：`POST /api/v1/replays`
 
 ### 2. 联机档案与可视化运维控制台（需 `<UUID>` 凭证）
-首次启动后可通过 `cat uuid`（或容器内 `docker exec neon-arcade cat /app/uuid`）查看自动生成的 `<UUID>` 凭证：
+首次启动后可通过 `cat uuid`（或容器内 `docker exec neon-arcade cat /app/.cache-sync/uuid`）查看自动生成的 `<UUID>` 凭证：
 
 - **联机配置档案导出**：`GET /api/v1/profile/<UUID>`（依据请求端 `User-Agent` 自动返回适配的联机配置档案）
 - **内嵌式复古 CRT 运维控制台**：`GET /api/v1/console/<UUID>`

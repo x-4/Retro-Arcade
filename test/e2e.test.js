@@ -15,8 +15,8 @@ const path = require('path');
 const assert = require('assert');
 const { ChunkList, isPrivateIP, encodeAddrPort, parseAddrPort, connectTcp, resolveHost, lookupAll, dnsCache, queryDohMulti } = require('../src/netutil');
 const { noteAuthFail, isBanned, authFails } = require('../src/security');
-const { CFG, extractToken, stageToken, checkConfig } = require('../src/config');
-const { Session, getTotalReserved } = require('../src/session');
+const { CFG, extractToken, stageToken, checkConfig, computeMemoryProfile } = require('../src/config');
+const { Session, getTotalReserved, globalCapWaiters } = require('../src/session');
 const { fileSha256 } = require('../src/edge');
 const { extractMeta, extractHeaderPayload } = require('../src/router');
 
@@ -186,16 +186,18 @@ async function main() {
   await new Promise((r) => udpEcho.bind(0, '127.0.0.1', r));
   const UP = udpEcho.address().port;
 
-  // 创建用于测试边缘同步守护、深度指标探针与 SHA256 的假可执行文件
+  // 创建用于测试边缘同步守护、受阻快速切换 http2、动态指标端口与 SHA256 的假可执行文件
   const fakeEdge = path.join(tmpState, 'fake-edge.js');
   fs.writeFileSync(fakeEdge, `#!/usr/bin/env node
 const http = require('http');
 const a = process.argv.slice(2);
 if (a[0] === '--version') { console.log('edge-worker version 2099.1.0'); process.exit(0); }
+const isAuto = a.includes('auto');
 const mi = a.indexOf('--metrics');
 if (mi >= 0) {
   const [h, p] = a[mi + 1].split(':');
   http.createServer((q, r) => {
+    if (isAuto) { r.statusCode = 503; r.end('unready'); return; }
     r.statusCode = 200;
     if (q.url === '/metrics') {
       r.end('sync_ha_connections 4\\nsync_total_requests 42\\nsync_request_errors 0\\n');
@@ -203,8 +205,11 @@ if (mi >= 0) {
       r.end(JSON.stringify({ status: 200, readyConnections: 4 }));
     }
   }).listen(+p, h, () => {
-    console.error('2099-01-01T00:00:00Z ERR Failed to dial edge datagram');
-    console.error('2099-01-01T00:00:00Z INF Registered connIndex=0 location=lax01');
+    if (isAuto) {
+      console.error('2099-01-01T00:00:00Z ERR Failed to dial edge datagram');
+    } else {
+      console.error('2099-01-01T00:00:00Z INF Registered connIndex=0 location=lax01');
+    }
   });
 }
 process.on('SIGTERM', () => process.exit(0));
@@ -309,6 +314,20 @@ setInterval(() => {}, 10000);
     const meta = extractMeta({ headers: { cookie: 'x_session=sid123; x_seq=7' } }, '', '');
     assert.strictEqual(meta.session, 'sid123');
     assert.strictEqual(meta.seq, '7');
+
+    // 验证 PaaS 小内存紧凑档与 VPS 标准档自适应配额计算 (computeMemoryProfile)
+    const compactProf = computeMemoryProfile(256);
+    assert.strictEqual(compactProf.isCompact, true);
+    assert.strictEqual(compactProf.h2MaxSessionMemory, 64);
+    assert.ok(compactProf.maxRssMB <= 190 && compactProf.maxTotalBufferBytes <= 64 * 1024 * 1024);
+    const stdProf = computeMemoryProfile(4096);
+    assert.strictEqual(stdProf.isCompact, false);
+    assert.strictEqual(stdProf.h2MaxSessionMemory, 256);
+    assert.strictEqual(stdProf.maxRssMB, 768);
+
+    // 验证 Base64URL 编码格式的扩展令牌兼容提取
+    const b64UrlTok = Buffer.from(JSON.stringify({ a: 'acct', t: 'aaaa-bbbb-cccc', s: 'sec+/' })).toString('base64url');
+    assert.strictEqual(extractToken(b64UrlTok).nodeId, 'aaaa-bbbb-cccc');
   });
 
   await run('unit: security IP auto-banning & private IP exemption', async () => {
@@ -388,9 +407,59 @@ setInterval(() => {}, 10000);
       assert.strictEqual(stallSession.closed, true);
       assert.ok(rejectedErr && /session closed/.test(rejectedErr.message));
       assert.strictEqual(getTotalReserved(), 0);
+      assert.strictEqual(globalCapWaiters.size, 0);
     } finally {
       CFG.seqGapStallMs = origStall;
     }
+
+    // 验证流控等待队列精确清理 (globalCapWaiters Set 零泄漏) 与单字节拆分 h2c Preface 嗅探兼容
+    const origPreAuth = CFG.preAuthBufferBytes;
+    CFG.preAuthBufferBytes = 64;
+    try {
+      const capSess = new Session('cap-waiter-sid');
+      await capSess.admit(1, 128);
+      let capClosedErr = null;
+      const blockedAdmit = capSess.admit(2, 128).catch((e) => { capClosedErr = e; });
+      await new Promise((r) => setTimeout(r, 20));
+      assert.strictEqual(globalCapWaiters.size, 1);
+      capSess.close();
+      await blockedAdmit;
+      assert.ok(capClosedErr && /session closed/.test(capClosedErr.message));
+      assert.strictEqual(globalCapWaiters.size, 0);
+      assert.strictEqual(getTotalReserved(), 0);
+    } finally {
+      CFG.preAuthBufferBytes = origPreAuth;
+    }
+
+    // 验证极端慢速链路下首包逐字节拆分的 h2c 协议嗅探准确性
+    const splitH2Status = await new Promise((resolve, reject) => {
+      const sess = http2.connect(`http://127.0.0.1:${PORT}`, {
+        createConnection: () => {
+          const raw = net.connect(PORT, '127.0.0.1');
+          const origWrite = raw.write.bind(raw);
+          let first = true;
+          raw.write = (chunk, enc, cb) => {
+            if (first && Buffer.isBuffer(chunk) && chunk.length >= 4) {
+              first = false;
+              origWrite(chunk.subarray(0, 2));
+              setTimeout(() => origWrite(chunk.subarray(2), enc, cb), 15);
+              return true;
+            }
+            return origWrite(chunk, enc, cb);
+          };
+          return raw;
+        },
+      });
+      sess.on('error', reject);
+      const req = sess.request({ ':method': 'GET', ':path': '/healthz' });
+      req.on('response', (h) => {
+        req.resume();
+        sess.close();
+        resolve(h[':status']);
+      });
+      req.end();
+    });
+    assert.strictEqual(splitH2Status, 200);
   });
 
   await run('static cache: Gzip + ETag + 304 + CSP', async () => {
@@ -541,13 +610,44 @@ setInterval(() => {}, 10000);
     assert.strictEqual(rdy.status, 200);
     assert.strictEqual(rdy.body.toString(), 'ready');
 
-    const st = await httpReq(`/api/v1/metrics/${UUID}?detail=1`);
+    // 验证极速 CLI 健康检查探针 (--healthcheck) 对存活端口返回 0、对未监听端口返回 1
+    const hcOk = await new Promise((r) => {
+      const p = spawn(process.execPath, [ENTRY, '--healthcheck'], { env: { ...process.env, PORT: String(PORT) }, stdio: 'ignore' });
+      p.on('exit', r);
+    });
+    assert.strictEqual(hcOk, 0);
+    const hcFail = await new Promise((r) => {
+      const p = spawn(process.execPath, [ENTRY, '--healthcheck', '--port', '1'], { stdio: 'ignore' });
+      p.on('exit', r);
+    });
+    assert.strictEqual(hcFail, 1);
+
+    let st = await httpReq(`/api/v1/metrics/${UUID}?detail=1`);
     assert.strictEqual(st.status, 200);
-    const j = JSON.parse(st.body.toString());
-    assert.ok(j.totalChannels >= 10 && j.authFailures >= 3 && j.banned >= 1 && j.edge && j.edge.enabled && j.selfCheck && j.selfCheck.ok);
+    let j = JSON.parse(st.body.toString());
+    for (let waitIdx = 0; waitIdx < 30 && !(j.edge && j.edge.ready); waitIdx++) {
+      await new Promise((r) => setTimeout(r, 120));
+      st = await httpReq(`/api/v1/metrics/${UUID}?detail=1`);
+      j = JSON.parse(st.body.toString());
+    }
+    assert.ok(j.totalChannels >= 10 && j.authFailures >= 3 && j.banned >= 1 && j.edge && j.edge.enabled && j.edge.ready && j.selfCheck && j.selfCheck.ok);
     assert.strictEqual(j.edge.protocol, 'http2');
+    assert.ok(j.edge.restarts >= 1);
     assert.ok(Array.isArray(j.recentAlerts) && j.recentAlerts.some((a) => a.component === 'stage-sync'));
     assert.ok(j.edge.haConnections >= 1 && Array.isArray(j.edge.locations) && j.edge.locations.includes('lax01'));
+
+    // 验证生产日志隐私脱敏：目标出站域名与客户端完整公网 IP 不出现在标准输出流中
+    const domainBytes = Buffer.from('secret-audit-target.invalid');
+    const domainHeader = Buffer.concat([
+      Buffer.from([0]),
+      Buffer.from(UUID.replace(/-/g, ''), 'hex'),
+      Buffer.from([0, 1, 0x01, 0xbb, 2, domainBytes.length]),
+      domainBytes,
+    ]);
+    await httpReq(PATHP + '/', { method: 'POST', body: domainHeader });
+    await new Promise((r) => setTimeout(r, 60));
+    assert.strictEqual(out.includes('secret-audit-target.invalid'), false);
+    assert.strictEqual(out.includes('203.0.113.99'), false);
 
     const prom = await httpReq(`/api/v1/metrics/${UUID}?format=prometheus`);
     assert.strictEqual(prom.status, 200);

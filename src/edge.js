@@ -235,6 +235,7 @@ let haConnections = 0;
 let totalEdgeRequests = 0;
 let edgeRequestErrors = 0;
 let activeRestartTimer = null;
+let quicFallbackTimer = null;
 const activeConns = new Map();
 
 function stopEdge(graceMs = 3500) {
@@ -242,6 +243,7 @@ function stopEdge(graceMs = 3500) {
   edgeDraining = true;
   edgeReady = false;
   if (activeRestartTimer) { clearTimeout(activeRestartTimer); activeRestartTimer = null; }
+  if (quicFallbackTimer) { clearTimeout(quicFallbackTimer); quicFallbackTimer = null; }
   activeConns.clear();
   haConnections = 0;
   const c = edgeChild;
@@ -347,7 +349,6 @@ async function startEdge() {
   const env = { ...process.env, [TOKEN_ENV_KEY]: EDGE.token };
   delete env.UUID; delete env.TOKEN;
   let metricsPort = 0;
-  try { metricsPort = await freePort(); } catch { metricsPort = 0; }
 
   const dir = stateDir();
   const pidFile = dir && path.join(dir, 'arcade-syncd.pid');
@@ -386,11 +387,14 @@ async function startEdge() {
       try { edgeBin = await resolveEdgeBin(); needResolve = false; }
       catch (e) { log('error', e.message); backoff = Math.min(backoff * 2, 60000); return scheduleRestart(backoff); }
     }
+    // 每次拉起同步进程前动态分配空闲回环指标端口，杜绝长周期运行后临时端口被抢占导致重启死循环
+    try { metricsPort = await freePort(); } catch { metricsPort = 0; }
     const args = [RUN_SUBCMD, NO_UPDATE_FLAG, PROTO_FLAG, activeProtocol, GRACE_FLAG, '4s'];
     if (metricsPort) args.push(METRICS_FLAG, `127.0.0.1:${metricsPort}`);
     args.push('run');
 
     spawnedAt = Date.now(); lastOk = spawnedAt; ready = false; edgeReady = false; consecutiveProbeFails = 0;
+    if (quicFallbackTimer) { clearTimeout(quicFallbackTimer); quicFallbackTimer = null; }
     activeConns.clear();
     haConnections = 0;
     log('info', `[stage-sync] 启动跨区同步工作进程 (实例 ${EDGE.nodeId}，模式 ${activeProtocol})`);
@@ -408,6 +412,7 @@ async function startEdge() {
       if (REG_RE.test(line)) {
         lastOk = Date.now();
         consecutiveProbeFails = 0;
+        if (quicFallbackTimer) { clearTimeout(quicFallbackTimer); quicFallbackTimer = null; }
         const idxM = CONN_IDX_RE.exec(line);
         const locM = LOC_RE.exec(line);
         activeConns.set(idxM ? idxM[1] : String(activeConns.size), locM ? locM[1] : 'edge');
@@ -424,6 +429,16 @@ async function startEdge() {
       }
       if (activeProtocol === 'auto' && /\b(ERR|FTL)\b/.test(line) && QUIC_RE.test(line)) {
         degradeToHttp2IfNeeded('数据报通道受限');
+        // 若尚未建立任何跨区连接且数据报受阻，防抖 1.5s 后仍未就绪则立即重拉切换 http2（免除 90s 超时干等）
+        if (!ready && activeConns.size === 0 && !quicFallbackTimer && !requested) {
+          quicFallbackTimer = setTimeout(() => {
+            quicFallbackTimer = null;
+            if (!edgeStopping && !ready && activeConns.size === 0 && edgeChild === child && child.exitCode === null) {
+              restartEdge('数据报握手受阻，快速切换 http2');
+            }
+          }, 1500);
+          quicFallbackTimer.unref();
+        }
       }
       log('debug', '[syncd] ' + line);
     };
@@ -432,11 +447,13 @@ async function startEdge() {
       st.on('data', (d) => { const parts = (rest + d).split('\n'); rest = parts.pop(); parts.forEach(onLine); });
     }
     child.on('error', (e) => {
+      if (quicFallbackTimer) { clearTimeout(quicFallbackTimer); quicFallbackTimer = null; }
       recordAlert('error', 'stage-sync', `同步进程启动失败: ${e.message}`);
       if (['ENOENT', 'EACCES', 'ENOEXEC'].includes(e.code)) { needResolve = true; }
       scheduleRestart(backoff); backoff = Math.min(backoff * 2, 60000);
     });
     child.on('exit', (code, sig) => {
+      if (quicFallbackTimer) { clearTimeout(quicFallbackTimer); quicFallbackTimer = null; }
       ready = false; edgeReady = false; edgeRestarts++;
       if (pidFile) { try { if (parseInt(fs.readFileSync(pidFile, 'utf8'), 10) === child.pid) fs.rmSync(pidFile, { force: true }); } catch {} }
       if (edgeStopping) return;

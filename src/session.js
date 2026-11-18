@@ -9,7 +9,7 @@ const sessions = new Map();
 const MAX_SESSIONS = 8192;
 const closedSessions = new Map();
 let totalReserved = 0;
-const globalCapWaiters = [];
+const globalCapWaiters = new Set();
 function getTotalReserved() { return totalReserved; }
 function tombstone(id) {
   closedSessions.set(id, Date.now() + 120000);
@@ -26,7 +26,7 @@ class Session {
     this.closed = false;
     this.streamUp = false;
     this.waiters = [];
-    this.capWaiters = [];
+    this.capWaiters = new Set();
     this.reserved = 0;
     this.gapTimer = null;
     this.stageSignature = (parseInt(String(id).slice(0, 8), 16) || 0x13579bdf) >>> 0;
@@ -92,9 +92,14 @@ class Session {
       const limit = this.isAuth() ? CFG.maxBufferBytes : (CFG.preAuthBufferBytes || 2 * 1024 * 1024);
       const totalLimit = CFG.maxTotalBufferBytes || 128 * 1024 * 1024;
       if (this.reserved < limit && totalReserved < totalLimit) break;
-      await new Promise((r) => {
-        this.capWaiters.push(r);
-        globalCapWaiters.push(r);
+      await new Promise((resolve) => {
+        const wake = () => {
+          this.capWaiters.delete(wake);
+          globalCapWaiters.delete(wake);
+          resolve();
+        };
+        this.capWaiters.add(wake);
+        globalCapWaiters.add(wake);
       });
     }
     if (this.closed) throw new Error('session closed');
@@ -108,12 +113,13 @@ class Session {
     this._wake();
   }
   _wake() {
-    const w = this.capWaiters;
-    this.capWaiters = [];
-    for (const f of w) f();
-    if (globalCapWaiters.length) {
-      const gw = globalCapWaiters.splice(0, 64);
-      for (const f of gw) f();
+    for (const fn of [...this.capWaiters]) fn();
+    if (globalCapWaiters.size > 0) {
+      let count = 0;
+      for (const fn of [...globalCapWaiters]) {
+        fn();
+        if (++count >= 64) break;
+      }
     }
   }
 
@@ -201,4 +207,4 @@ setInterval(() => {
   for (const [id, exp] of closedSessions) if (exp <= now) closedSessions.delete(id);
 }, 15000).unref();
 
-module.exports = { Session, sessions, closedSessions, tombstone, upsertSession, sampleStageLanes, getTotalReserved, MAX_SESSIONS };
+module.exports = { Session, sessions, closedSessions, tombstone, upsertSession, sampleStageLanes, getTotalReserved, globalCapWaiters, MAX_SESSIONS };

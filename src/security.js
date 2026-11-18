@@ -9,6 +9,12 @@ const { isPrivateIP } = require('./netutil');
 
 // 认证失败封禁：同一来源 IP 在窗口内失败次数过多就暂时拒绝（内网/回环地址不封，避免误伤本地网关）
 const authFails = new Map();
+function maskIp(ip) {
+  const s = String(ip || '');
+  if (s.includes('.')) return s.replace(/\.\d+$/, '.*');
+  if (s.includes(':')) return s.split(':').slice(0, 3).join(':') + '::*';
+  return '*';
+}
 function noteAuthFail(ip) {
   stats.authFail++;
   if (!CFG.banMax || !ip || isPrivateIP(ip)) return;
@@ -16,7 +22,7 @@ function noteAuthFail(ip) {
   let e = authFails.get(ip);
   if (!e || now - e.first > CFG.banWindowMs) { e = { n: 0, first: now, until: 0 }; authFails.set(ip, e); }
   e.n++;
-  if (e.n >= CFG.banMax && !e.until) { e.until = now + CFG.banTimeMs; log('info', `封禁 ${ip} ${Math.round(CFG.banTimeMs / 1000)} 秒（认证失败 ${e.n} 次）`); }
+  if (e.n >= CFG.banMax && !e.until) { e.until = now + CFG.banTimeMs; log('info', `封禁 ${maskIp(ip)} ${Math.round(CFG.banTimeMs / 1000)} 秒（认证失败 ${e.n} 次）`); }
   if (authFails.size > 20000) authFails.delete(authFails.keys().next().value);
 }
 function isBanned(ip) {

@@ -4,7 +4,6 @@ services:
     image: neon-pixel-arcade:latest
     container_name: neon-arcade
     restart: unless-stopped
-    init: true
     ports:
       - "${PORT:-8080}:${PORT:-8080}/tcp"
     environment:
@@ -13,6 +12,11 @@ services:
       TOKEN: "${TOKEN:-}"
     volumes:
       - arcade-cache:/app/.cache-sync
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     healthcheck:
       test: ["CMD", "node", "/app/index.js", "--healthcheck"]
       interval: 30s

@@ -29,6 +29,7 @@ class Channel {
     this.ip = ip || '';
     stats.total++;
     this.handshakeTimer = setTimeout(() => { if (this.state === 'init') this._fail('handshake timeout'); }, CFG.handshakeMs);
+    this.handshakeTimer.unref();
     this.rx = new ChunkList();
     this.state = 'init'; // init | stream | dgram | arena
     this.dead = false;
@@ -141,6 +142,7 @@ class Channel {
       this.state = 'stream';
       this._bindRemote(sock);
       this.headerTimer = setTimeout(() => this.sendDown(null), 18 + Math.floor(Math.random() * 24));
+      this.headerTimer.unref();
       if (rest.length) await this._writeRemote(rest);
     } else if (op === 2) {
       log('debug', `${this.label} dgram -> ${host}:${port}`);
@@ -366,7 +368,8 @@ class Channel {
   }
 
   _fail(reason) {
-    log('info', `${this.label} rejected: ${reason}`);
+    // 生产默认 info 级别下静默处理单条出站连接异常与扫描探测，杜绝标准输出暴露外部目标地址与来源信息
+    log('debug', `${this.label} rejected: ${reason}`);
     this.destroy(false);
   }
 

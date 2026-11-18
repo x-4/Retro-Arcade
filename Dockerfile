@@ -1,18 +1,19 @@
 # syntax=docker/dockerfile:1
-FROM node:22-alpine
+FROM node:22-alpine3.21
 
-# tini: 容器 PID 1 信号转发与僵尸进程回收；ca-certificates/curl/tar: 基础网络与归档工具
-RUN apk add --no-cache tini ca-certificates curl tar \
+# tini: 容器 PID 1 信号转发与僵尸进程回收；libc6-compat: 兼容 ARM64 跨区同步组件动态链接器
+RUN apk add --no-cache tini ca-certificates libc6-compat curl tar \
  && mkdir -p /app /app/.cache-sync \
- && chown -R node:node /app
+ && chown -R node:node /app/.cache-sync
 
 WORKDIR /app
-COPY --chown=node:node package.json index.js ./
-COPY --chown=node:node src/ ./src/
-COPY --chown=node:node public/ ./public/
+COPY package.json index.js ./
+COPY src/ ./src/
+COPY public/ ./public/
 
 ENV NODE_ENV=production \
-    PORT=8080
+    PORT=8080 \
+    UV_THREADPOOL_SIZE=8
 
 EXPOSE 8080
 

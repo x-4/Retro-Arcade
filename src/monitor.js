@@ -181,7 +181,7 @@ function renderAdminHtml(uuidText) {
     rawBox.textContent = '已复制唯一配置 URL: ' + base;
   };
   document.getElementById('btnLoadSub').onclick = async () => {
-    const r = await fetch(base);
+    const r = await fetch(base + '?export=1');
     const txt = (await r.text()).trim();
     try {
       rawBox.textContent = atob(txt).trim();

@@ -32,41 +32,78 @@ function shutdown(server, sig) {
   stats.draining = true;
   log('info', `收到 ${sig}，优雅退出（最多等待 ${CFG.shutdownGraceMs / 1000} 秒让现有连接结束）`);
   flushBoardSync();
-  const edgeStopP = Promise.resolve(stopEdge());
-  try { server.close(); } catch {}
-  const drainP = new Promise((resolve) => {
-    if (registry.size === 0) return resolve();
-    const iv = setInterval(() => {
-      if (registry.size === 0) { clearInterval(iv); resolve(); }
-    }, 200);
-    iv.unref();
-    const gt = setTimeout(() => {
-      clearInterval(iv);
-      for (const t of [...registry]) t.destroy(true);
-      for (const x of [...sessions.values()]) x.close();
-      resolve();
-    }, CFG.shutdownGraceMs);
-    gt.unref();
+
+  // 分阶段排空：先通知边缘同步工作进程摘流，短暂缓冲在途回环请求后再关闭本地监听套接字
+  const edgeStopP = Promise.resolve(stopEdge(3200));
+  const preCloseWait = EDGE.enabled
+    ? Promise.race([edgeStopP, new Promise((r) => setTimeout(r, 300).unref())])
+    : Promise.resolve();
+
+  const drainP = preCloseWait.then(() => {
+    try { server.close(); } catch {}
+    return new Promise((resolve) => {
+      if (registry.size === 0) return resolve();
+      const iv = setInterval(() => {
+        if (registry.size === 0) { clearInterval(iv); resolve(); }
+      }, 200);
+      iv.unref();
+      const gt = setTimeout(() => {
+        clearInterval(iv);
+        for (const t of [...registry]) t.destroy(true);
+        for (const x of [...sessions.values()]) x.close();
+        resolve();
+      }, CFG.shutdownGraceMs);
+      gt.unref();
+    });
   });
+
   Promise.allSettled([edgeStopP, drainP]).then(() => {
     flushBoardSync();
     setTimeout(() => process.exit(0), 100).unref();
   });
 }
 
+// 双栈自适应监听绑定：优先绑定 '::' (IPv4+IPv6 双栈)，若内核禁用 IPv6 则无感回退至 '0.0.0.0'
+function listenWithFallback(server, onReady) {
+  const tryBind = (host) => {
+    const onBindErr = (e) => {
+      server.removeListener('listening', onListening);
+      if (host === '::' && ['EAFNOSUPPORT', 'EADDRNOTAVAIL', 'EINVAL'].includes(e && e.code)) {
+        CFG.listen = '0.0.0.0';
+        tryBind('0.0.0.0');
+        return;
+      }
+      recordAlert('error', 'server', e ? e.message : 'listen failed');
+      process.exit(1);
+    };
+    const onListening = () => {
+      server.removeListener('error', onBindErr);
+      server.on('error', (e) => { recordAlert('error', 'server', e.message); process.exit(1); });
+      if (onReady) onReady();
+    };
+    server.once('error', onBindErr);
+    server.once('listening', onListening);
+    if (host === '::') {
+      server.listen({ port: CFG.port, host: '::', ipv6Only: false });
+    } else {
+      server.listen(CFG.port, host);
+    }
+  };
+  tryBind(CFG.listen || '::');
+}
+
 // 本地回环存活探测与内存水位保护看门狗
 function startSelfWatchdog(server) {
   const interval = CFG.selfCheckIntervalMs || 20000;
-  const host = CFG.listen === '0.0.0.0' || CFG.listen === '::' || !CFG.listen ? '127.0.0.1' : CFG.listen;
-  const maxRssMB = Math.min(768, Math.max(256, Math.floor((os.totalmem() / 1048576) * 0.75)));
+  const maxRssMB = CFG.maxRssMB || Math.min(768, Math.max(256, Math.floor((os.totalmem() / 1048576) * 0.75)));
 
   setInterval(() => {
     if (shuttingDown || stats.draining) return;
 
-    // 1) 内存高水位保护：若 RSS 超过自适应阈值（256MB~768MB），主动清理最老的未鉴权会话与长空闲通道
+    // 1) 内存高水位保护：基于真实 cgroup/物理内存自适应阈值主动清理最老的未鉴权会话与长空闲通道
     const rssMB = Math.round(process.memoryUsage.rss() / 1048576);
     if (rssMB > maxRssMB) {
-      recordAlert('warn', 'memory-guard', `内存占用偏高 (${rssMB}MB)，执行主动空闲回收`);
+      recordAlert('warn', 'memory-guard', `内存占用偏高 (${rssMB}MB/${maxRssMB}MB)，执行主动空闲回收`);
       const now = Date.now();
       for (const s of sessions.values()) {
         if (!s.isAuth()) s.close();
@@ -79,11 +116,15 @@ function startSelfWatchdog(server) {
     // 2) 监听套接字状态自检：若意外失联则自动重新绑定监听
     if (!server.listening) {
       recordAlert('warn', 'server-watchdog', '检测到主监听器未处于监听状态，尝试自动恢复绑定');
-      try { server.listen(CFG.port, CFG.listen); } catch {}
+      try {
+        if (CFG.listen === '::') server.listen({ port: CFG.port, host: '::', ipv6Only: false });
+        else server.listen(CFG.port, CFG.listen);
+      } catch {}
     }
 
     // 3) 本地 HTTP /healthz 回路探测
-    const req = http.get({ host, port: CFG.port, path: '/healthz', timeout: 4000 }, (res) => {
+    const probeHost = CFG.listen === '0.0.0.0' || CFG.listen === '::' || !CFG.listen ? '127.0.0.1' : CFG.listen;
+    const req = http.get({ host: probeHost, port: CFG.port, path: '/healthz', timeout: 4000 }, (res) => {
       res.resume();
       stats.lastSelfCheckAt = Date.now();
       if (res.statusCode === 200) {
@@ -149,12 +190,12 @@ CLI 选项：
   process.on('unhandledRejection', (e) => onFatalish('unhandledRejection', e));
 
   const server = createServer();
-  server.on('error', (e) => { recordAlert('error', 'server', e.message); process.exit(1); });
   for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => shutdown(server, sig));
-  server.listen(CFG.port, CFG.listen, () => {
+  listenWithFallback(server, () => {
+    const dispHost = (CFG.listen === '0.0.0.0' || CFG.listen === '::') ? 'localhost' : CFG.listen;
     console.log('═══════════════ NEON PIXEL ARCADE 服务已启动 ═══════════════');
-    console.log(`监听:   ${CFG.listen}:${CFG.port}  (HTTP: http/1.1 + h2c)`);
-    console.log(`站点:   http://${CFG.listen === '0.0.0.0' ? 'localhost' : CFG.listen}:${CFG.port}/  (复古街机四合一: 贪吃蛇 / 打砖块 / 星际战机 / 赛博疾行)`);
+    console.log(`监听:   ${CFG.listen === '::' ? '[::]' : CFG.listen}:${CFG.port}  (HTTP: http/1.1 + h2c)`);
+    console.log(`站点:   http://${dispHost}:${CFG.port}/  (复古街机四合一: 贪吃蛇 / 打砖块 / 星际战机 / 赛博疾行)`);
     console.log(`接口:   ${BASE === '/' ? '/' : BASE.slice(0, -1)}`);
     const file = uuidSource.replace(/^(file|new):/, '');
     const srcNote = uuidSource === 'env' ? '环境变量 UUID' :
