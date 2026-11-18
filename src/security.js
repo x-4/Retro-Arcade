@@ -10,7 +10,8 @@ const { isPrivateIP } = require('./netutil');
 // 认证失败封禁：同一来源 IP 在窗口内失败次数过多就暂时拒绝（内网/回环地址不封，避免误伤本地网关）
 const authFails = new Map();
 function maskIp(ip) {
-  const s = String(ip || '');
+  const s = String(ip || '').trim().replace(/^::ffff:/i, '');
+  if (!s) return '?';
   if (s.includes('.')) return s.replace(/\.\d+$/, '.*');
   if (s.includes(':')) return s.split(':').slice(0, 3).join(':') + '::*';
   return '*';
@@ -47,4 +48,4 @@ setInterval(() => {
   }
 }, 15000).unref();
 
-module.exports = { authFails, noteAuthFail, isBanned, safeEq };
+module.exports = { authFails, noteAuthFail, isBanned, safeEq, maskIp };

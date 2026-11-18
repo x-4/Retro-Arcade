@@ -91,6 +91,7 @@ const CFG = {
   webDir: path.join(ROOT, 'public'),
   blockPrivate: true,
   idleMs: 300 * 1000,
+  bodyTimeoutMs: 30 * 1000,
   maxPost: 16 * 1024 * 1024,
   maxBufferBytes: MEM_PROFILE.maxBufferBytes,
   maxTotalBufferBytes: MEM_PROFILE.maxTotalBufferBytes,
@@ -185,6 +186,19 @@ function stateDir() {
   return (_stateDir = null);
 }
 
+function writeSecretAtomicSync(targetFile, content) {
+  if (!targetFile) return false;
+  const tmp = `${targetFile}.tmp-${process.pid}-${Date.now()}`;
+  try {
+    fs.writeFileSync(tmp, content, { mode: 0o600 });
+    fs.renameSync(tmp, targetFile);
+    return true;
+  } catch {
+    try { fs.rmSync(tmp, { force: true }); } catch {}
+    return false;
+  }
+}
+
 let uuidSource = 'env';
 const USERS = [];
 {
@@ -199,8 +213,8 @@ const USERS = [];
         if (txt) {
           raw = txt;
           uuidSource = 'file:' + f;
-          if (f === legacyFile && primaryFile) {
-            try { fs.writeFileSync(primaryFile, raw + '\n', { mode: 0o600 }); uuidSource = 'file:' + primaryFile; } catch {}
+          if (f === legacyFile && primaryFile && writeSecretAtomicSync(primaryFile, raw + '\n')) {
+            uuidSource = 'file:' + primaryFile;
           }
           break;
         }
@@ -208,8 +222,8 @@ const USERS = [];
     }
     if (!raw) {
       raw = crypto.randomUUID();
-      try { fs.writeFileSync(primaryFile, raw + '\n', { mode: 0o600 }); uuidSource = 'new:' + primaryFile; }
-      catch { uuidSource = 'ephemeral'; }
+      if (writeSecretAtomicSync(primaryFile, raw + '\n')) uuidSource = 'new:' + primaryFile;
+      else uuidSource = 'ephemeral';
     }
   }
   const list = raw.split(',').map((s) => s.trim()).filter(Boolean);

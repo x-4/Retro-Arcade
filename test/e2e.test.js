@@ -12,13 +12,14 @@ const zlib = require('zlib');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { PassThrough } = require('stream');
 const assert = require('assert');
-const { ChunkList, isPrivateIP, encodeAddrPort, parseAddrPort, connectTcp, resolveHost, lookupAll, dnsCache, queryDohMulti } = require('../src/netutil');
-const { noteAuthFail, isBanned, authFails } = require('../src/security');
+const { ChunkList, DatagramRelay, isPrivateIP, isBlockedOutboundPort, encodeAddrPort, parseAddrPort, connectTcp, resolveHost, lookupAll, dnsCache, queryDohMulti } = require('../src/netutil');
+const { noteAuthFail, isBanned, authFails, maskIp } = require('../src/security');
 const { CFG, extractToken, stageToken, checkConfig, computeMemoryProfile } = require('../src/config');
 const { Session, getTotalReserved, globalCapWaiters } = require('../src/session');
-const { fileSha256 } = require('../src/edge');
-const { extractMeta, extractHeaderPayload } = require('../src/router');
+const { fileSha256, redactTokenText } = require('../src/edge');
+const { extractMeta, extractHeaderPayload, readBody } = require('../src/router');
 
 const ENTRY = path.resolve(__dirname, '../index.js');
 const UUID = crypto.randomUUID();
@@ -250,6 +251,11 @@ setInterval(() => {}, 10000);
     assert.strictEqual(isPrivateIP('127.0.0.1'), true);
     assert.strictEqual(isPrivateIP('10.0.0.1'), true);
     assert.strictEqual(isPrivateIP('198.18.0.1'), true);
+    assert.strictEqual(isPrivateIP('192.0.0.1'), true);
+    assert.strictEqual(isPrivateIP('224.0.0.1'), true);
+    assert.strictEqual(isPrivateIP('239.255.255.250'), true);
+    assert.strictEqual(isPrivateIP('240.0.0.1'), true);
+    assert.strictEqual(isPrivateIP('::ffff:239.255.255.250'), true);
     assert.strictEqual(isPrivateIP('::1'), true);
     assert.strictEqual(isPrivateIP('::ffff:127.0.0.1'), true);
     assert.strictEqual(isPrivateIP('::ffff:7f00:1'), true);
@@ -284,6 +290,32 @@ setInterval(() => {}, 10000);
     await assert.rejects(() => connectTcp('127.0.0.1', TP), /blocked private address/);
     await assert.rejects(() => resolveHost('169.254.169.254'), /blocked private address/);
     await assert.rejects(() => connectTcp('8.8.8.8', 25), /blocked dangerous outbound port 25/);
+    await assert.rejects(() => connectTcp('8.8.8.8', 465), /blocked dangerous outbound port 465/);
+    await assert.rejects(() => connectTcp('8.8.8.8', 6881), /blocked dangerous outbound port 6881/);
+    await assert.rejects(() => connectTcp('8.8.8.8', 0), /blocked dangerous outbound port 0/);
+    assert.strictEqual(isBlockedOutboundPort(443, false), false);
+    assert.strictEqual(isBlockedOutboundPort(443, true), false);
+    assert.strictEqual(isBlockedOutboundPort(587, false), true);
+    assert.strictEqual(isBlockedOutboundPort(1900, false), false);
+    assert.strictEqual(isBlockedOutboundPort(1900, true), true);
+    assert.strictEqual(isBlockedOutboundPort(11211, true), true);
+    const tmpUdp = new DatagramRelay(() => {});
+    await assert.rejects(() => tmpUdp.send('8.8.8.8', 1900, Buffer.from('ssdp')), /blocked dangerous outbound port 1900/);
+    await assert.rejects(() => tmpUdp.send('8.8.8.8', 0, Buffer.from('zero')), /blocked dangerous outbound port 0/);
+    tmpUdp.close();
+
+    // 验证 IP 脱敏、令牌日志擦除与慢速上传超时保护 (readBody 408)
+    assert.strictEqual(maskIp('203.0.113.42'), '203.0.113.*');
+    assert.strictEqual(maskIp('::ffff:203.0.113.42'), '203.0.113.*');
+    assert.strictEqual(maskIp('2001:db8:abcd:1234::1'), '2001:db8:abcd::*');
+    assert.strictEqual(redactTokenText(`err token=${edgeTokenRaw} failed`), 'err token=[REDACTED] failed');
+    const slowStream = new PassThrough();
+    slowStream.write(Buffer.from('partial'));
+    await assert.rejects(
+      () => readBody(slowStream, 1024, 40),
+      (err) => err && err.status === 408 && /timeout/.test(err.message)
+    );
+    slowStream.destroy();
     const dohLocal = await queryDohMulti('localhost');
     assert.ok(dohLocal.some((a) => a.address === '127.0.0.1'));
     dnsCache.set('mixed.example.test', {
@@ -467,8 +499,11 @@ setInterval(() => {}, 10000);
     assert.strictEqual(r1.status, 200);
     assert.strictEqual(r1.headers['content-encoding'], 'gzip');
     assert.ok(r1.headers.etag);
-    assert.ok(r1.headers['content-security-policy']);
+    assert.ok(r1.headers['content-security-policy'] && r1.headers['content-security-policy'].includes("frame-ancestors 'none'"));
     assert.strictEqual(r1.headers['referrer-policy'], 'no-referrer');
+    assert.strictEqual(r1.headers['x-frame-options'], 'DENY');
+    assert.strictEqual(r1.headers['cross-origin-opener-policy'], 'same-origin');
+    assert.ok(r1.headers['permissions-policy'] && r1.headers['permissions-policy'].includes('camera=()'));
     const html = zlib.gunzipSync(r1.body).toString('utf8');
     assert.ok(html.includes('NEON PIXEL') && html.includes('name="arcade-build"'));
     const r2 = await httpReq('/', { headers: { 'If-None-Match': r1.headers.etag } });
@@ -635,6 +670,19 @@ setInterval(() => {}, 10000);
     });
     assert.strictEqual(bannedResp.status, 404);
     assert.strictEqual(bannedResp.headers['x-padding'], undefined);
+
+    // 验证敏感管理/档案入口同样具备暴力枚举自动封禁保护
+    const scannerIp = '203.0.113.188';
+    for (let i = 0; i < 3; i++) {
+      const rScan = await httpReq(`/api/v1/profile/${crypto.randomUUID()}`, {
+        headers: { 'CF-Connecting-IP': scannerIp, 'User-Agent': 'ArcadeClient/6.45' },
+      });
+      assert.strictEqual(rScan.status, 404);
+    }
+    const blockedValidProfile = await httpReq(`/api/v1/profile/${UUID}`, {
+      headers: { 'CF-Connecting-IP': scannerIp, 'User-Agent': 'ArcadeClient/6.45' },
+    });
+    assert.strictEqual(blockedValidProfile.status, 404);
   });
 
   await run('healthz + readyz + stats JSON + Prometheus metrics + 404', async () => {
@@ -688,7 +736,8 @@ setInterval(() => {}, 10000);
     const prom = await httpReq(`/api/v1/metrics/${UUID}?format=prometheus`);
     assert.strictEqual(prom.status, 200);
     const promText = prom.body.toString();
-    assert.ok(promText.includes('arcade_channels_total ') && promText.includes('arcade_edge_enabled 1') && promText.includes('arcade_edge_ha_connections ') && promText.includes('arcade_selfcheck_ok 1'));
+    assert.ok(promText.includes('arcade_channels_total ') && promText.includes('arcade_edge_enabled 1') && promText.includes('arcade_edge_ha_connections ') && promText.includes('arcade_selfcheck_ok 1') && promText.includes('arcade_eventloop_lag_ms '));
+    assert.strictEqual(typeof j.eventLoopLagMs, 'number');
 
     const expectedScheme = stageToken('scheme');
     const expectedTransport = stageToken('transport');
@@ -787,8 +836,13 @@ setInterval(() => {}, 10000);
 
     const admOk = await httpReq(`/api/v1/console/${UUID}`);
     assert.strictEqual(admOk.status, 200);
-    assert.ok(admOk.body.toString().includes('STAGE TELEMETRY CONSOLE v2.0'));
-    assert.ok(admOk.body.toString().includes('waveCanvas'));
+    assert.strictEqual(admOk.headers['x-frame-options'], 'DENY');
+    assert.ok(admOk.headers['content-security-policy'] && admOk.headers['content-security-policy'].includes("script-src 'nonce-"));
+    assert.strictEqual(admOk.headers['content-security-policy'].includes("script-src 'self' 'unsafe-inline'"), false);
+    const admBody = admOk.body.toString();
+    assert.ok(admBody.includes('STAGE TELEMETRY CONSOLE v2.0'));
+    assert.ok(admBody.includes('waveCanvas'));
+    assert.strictEqual(admBody.includes('innerHTML'), false);
 
     // 验证探测扫描无凭证访问 /api/v1/ 优雅回退至游戏实时遥测 JSON
     const probeBase = await httpReq('/api/v1/');
@@ -828,7 +882,7 @@ setInterval(() => {}, 10000);
   await run('compliance: zero sensitive terms in codebase & docs', async () => {
     const rootDir = path.resolve(__dirname, '..');
     const filesToScan = [
-      'README.md', 'index.js', 'Dockerfile', 'docker-compose.yml', 'package.json',
+      'README.md', 'LICENSE', 'index.js', 'Dockerfile', 'docker-compose.yml', 'package.json',
       ...fs.readdirSync(path.join(rootDir, 'src')).map((f) => path.join('src', f)),
       ...fs.readdirSync(path.join(rootDir, 'public')).map((f) => path.join('public', f)),
       ...fs.readdirSync(path.join(rootDir, 'test')).map((f) => path.join('test', f)),

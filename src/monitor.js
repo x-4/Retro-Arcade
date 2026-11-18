@@ -1,6 +1,7 @@
 'use strict';
 // 运行状态快照 + Prometheus 指标导出 + 内嵌式复古像素管理控制台 + 周期性统计日志
 
+const { monitorEventLoopDelay } = require('perf_hooks');
 const { CFG } = require('./config');
 const { log } = require('./log');
 const { stats, alerts, fmtBytes } = require('./stats');
@@ -8,6 +9,15 @@ const { authFails } = require('./security');
 const { registry } = require('./channel');
 const { sessions } = require('./session');
 const { edgeStatus } = require('./edge');
+
+const loopDelay = monitorEventLoopDelay({ resolution: 20 });
+loopDelay.enable();
+
+function currentLoopLagMs() {
+  if (!loopDelay || loopDelay.count === 0) return 0;
+  const ms = (loopDelay.percentile(99) - 20e6) / 1e6;
+  return ms > 0 && Number.isFinite(ms) ? Number(ms.toFixed(2)) : 0;
+}
 
 function snapshot() {
   const edge = edgeStatus();
@@ -30,6 +40,7 @@ function snapshot() {
     alertsTotal: stats.alertsTotal,
     recentAlerts: alerts.slice(-10),
     rssMB: Math.round(process.memoryUsage.rss() / 1048576),
+    eventLoopLagMs: currentLoopLagMs(),
     node: process.version,
     ...(edge.enabled ? { edge } : {}),
   };
@@ -78,6 +89,9 @@ function prometheusMetrics() {
     '# HELP process_resident_memory_bytes Resident memory size in bytes',
     '# TYPE process_resident_memory_bytes gauge',
     `process_resident_memory_bytes ${process.memoryUsage.rss()}`,
+    '# HELP arcade_eventloop_lag_ms Event loop p99 scheduling lag in milliseconds',
+    '# TYPE arcade_eventloop_lag_ms gauge',
+    `arcade_eventloop_lag_ms ${s.eventLoopLagMs}`,
     '# HELP arcade_edge_enabled Whether edge sync worker supervision is enabled',
     '# TYPE arcade_edge_enabled gauge',
     `arcade_edge_enabled ${edge.enabled ? 1 : 0}`,
@@ -102,8 +116,9 @@ function prometheusMetrics() {
 }
 
 // 内嵌式复古像素 CRT 监控与配置导出面板（GET /api/v1/console/<UUID>）
-function renderAdminHtml(uuidText) {
+function renderAdminHtml(uuidText, nonce = '') {
   const safeId = encodeURIComponent(uuidText);
+  const nonceAttr = nonce ? ` nonce="${String(nonce).replace(/"/g, '')}"` : '';
   return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -170,7 +185,7 @@ function renderAdminHtml(uuidText) {
     </table>
   </div>
 </div>
-<script>
+<script${nonceAttr}>
 (() => {
   const uid = ${JSON.stringify(safeId)};
   const base = location.origin + '/api/v1/profile/' + uid;
@@ -237,9 +252,16 @@ function renderAdminHtml(uuidText) {
       document.getElementById('vSys').textContent = d.uptimeSec + 's / ' + d.rssMB + 'MB';
       const tb = document.getElementById('alertBody');
       if (d.recentAlerts && d.recentAlerts.length) {
-        tb.innerHTML = d.recentAlerts.slice().reverse().map(a =>
-          '<tr><td>' + a.ts.slice(11,19) + '</td><td>' + a.level + '</td><td>' + a.component + '</td><td>' + a.message + '</td></tr>'
-        ).join('');
+        const rows = d.recentAlerts.slice().reverse().map((a) => {
+          const tr = document.createElement('tr');
+          for (const val of [String(a.ts || '').slice(11, 19), String(a.level || ''), String(a.component || ''), String(a.message || '')]) {
+            const td = document.createElement('td');
+            td.textContent = val;
+            tr.appendChild(td);
+          }
+          return tr;
+        });
+        tb.replaceChildren(...rows);
       }
     } catch {}
   }

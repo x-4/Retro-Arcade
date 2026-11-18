@@ -10,7 +10,7 @@ const crypto = require('crypto');
 const { CFG, BASE, USERS, INSTANCE_TAG, EDGE, stageToken } = require('./config');
 const { log } = require('./log');
 const { stats } = require('./stats');
-const { isBanned, noteAuthFail, safeEq } = require('./security');
+const { isBanned, noteAuthFail, safeEq, maskIp } = require('./security');
 const { isPrivateIP } = require('./netutil');
 const { Channel, registry, findUser, STAGE_REV } = require('./channel');
 const { closedSessions, sessions, upsertSession } = require('./session');
@@ -58,6 +58,14 @@ async function getStaticEntry(full, ext) {
   return entry;
 }
 
+function applyBrowserSecurityHeaders(res) {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=(), usb=(), interest-cohort=()');
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+}
+
 async function serveStatic(req, res, pathname) {
   if (req.method !== 'GET' && req.method !== 'HEAD') return false;
   if (!CFG.webDir) return false;
@@ -75,10 +83,9 @@ async function serveStatic(req, res, pathname) {
     res.setHeader('Cache-Control', (ext === '.html' || rel === '/sw.js') ? 'no-cache' : 'public, max-age=3600');
     if (rel === '/sw.js') res.setHeader('Service-Worker-Allowed', '/');
     res.setHeader('ETag', entry.etag);
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('Referrer-Policy', 'no-referrer');
+    applyBrowserSecurityHeaders(res);
     if (ext === '.html') {
-      res.setHeader('Content-Security-Policy', "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; worker-src 'self'");
+      res.setHeader('Content-Security-Policy', "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; worker-src 'self'; frame-ancestors 'none'; base-uri 'self'; object-src 'none'");
     }
     if (req.headers['if-none-match'] === entry.etag) {
       res.statusCode = 304;
@@ -150,9 +157,20 @@ function extractHeaderPayload(req) {
   const cookies = parseCookies(req.headers.cookie);
   for (const key of DATA_KEYS) {
     const chunks = [];
-    for (let i = 0; req.headers[`${key.toLowerCase()}-${i}`]; i++) chunks.push(req.headers[`${key.toLowerCase()}-${i}`]);
+    let totalChars = 0;
+    for (let i = 0; i < 64 && req.headers[`${key.toLowerCase()}-${i}`]; i++) {
+      const part = String(req.headers[`${key.toLowerCase()}-${i}`]);
+      totalChars += part.length;
+      if (totalChars > 87384) throw Object.assign(new Error('header payload too large'), { status: 413 });
+      chunks.push(part);
+    }
     if (chunks.length) return Buffer.from(chunks.join(''), 'base64url');
-    for (let i = 0; cookies[`${key}_${i}`]; i++) chunks.push(cookies[`${key}_${i}`]);
+    for (let i = 0; i < 64 && cookies[`${key}_${i}`]; i++) {
+      const part = String(cookies[`${key}_${i}`]);
+      totalChars += part.length;
+      if (totalChars > 87384) throw Object.assign(new Error('cookie payload too large'), { status: 413 });
+      chunks.push(part);
+    }
     if (chunks.length) return Buffer.from(chunks.join(''), 'base64url');
   }
   return null;
@@ -241,15 +259,32 @@ function makeDown(res) {
   };
 }
 
-async function readBody(req, limit) {
+async function readBody(req, limit, timeoutMs = CFG.bodyTimeoutMs || 30000) {
   const chunks = [];
   let n = 0;
-  for await (const c of req) {
-    n += c.length;
-    if (n > limit) throw Object.assign(new Error('too large'), { status: 413 });
-    chunks.push(c);
+  const it = req[Symbol.asyncIterator]();
+  for (;;) {
+    let timer = null;
+    const step = await Promise.race([
+      it.next(),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          reject(Object.assign(new Error('body read timeout'), { status: 408 }));
+        }, timeoutMs);
+        timer.unref();
+      }),
+    ]).finally(() => {
+      if (timer) clearTimeout(timer);
+    });
+    if (!step || step.done) break;
+    const c = step.value;
+    if (c && c.length) {
+      n += c.length;
+      if (n > limit) throw Object.assign(new Error('too large'), { status: 413 });
+      chunks.push(c);
+    }
   }
-  return chunks.length === 1 ? chunks[0] : Buffer.concat(chunks);
+  return chunks.length === 0 ? Buffer.alloc(0) : (chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, n));
 }
 
 // 流式上行：把请求体持续泵入实时通道（stream-one / stream-up）
@@ -302,6 +337,7 @@ function onGone(req, res, fn) {
 function respond(res, code, body) {
   if (res.headersSent) return;
   res.statusCode = code;
+  res.setHeader('X-Content-Type-Options', 'nosniff');
   if (body) {
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
     res.end(body);
@@ -313,9 +349,18 @@ function respond(res, code, body) {
 function respondJson(res, code, obj) {
   if (res.headersSent) return;
   res.statusCode = code;
+  res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   res.end(JSON.stringify(obj));
+}
+
+function matchUserPath(pathname, prefix) {
+  let matched = null;
+  for (const u of USERS) {
+    if (safeEq(pathname, prefix + u.text)) matched = u;
+  }
+  return matched;
 }
 
 async function readStreamPrefix(it, minBytes, timeoutMs) {
@@ -544,21 +589,25 @@ async function handleRequest(req, res) {
     return respond(res, 200, 'ready');
   }
   if (pathname.startsWith('/api/v1/metrics/')) {
+    const ip = clientIp(req);
+    if (isBanned(ip)) { stats.rejected++; return respond(res, 404); }
     if (req.method !== 'GET') return respond(res, 404);
-    const statUser = USERS.find((u) => safeEq(pathname, '/api/v1/metrics/' + u.text));
-    if (!statUser) return respond(res, 404);
+    const statUser = matchUserPath(pathname, '/api/v1/metrics/');
+    if (!statUser) { noteAuthFail(ip); return respond(res, 404); }
     res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
     if (/(^|&)format=prometheus(&|$)/.test(query) || /\btext\/plain\b/.test(String(req.headers.accept || ''))) {
       res.setHeader('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
       return res.end(prometheusMetrics());
     }
     res.setHeader('Content-Type', 'application/json');
     const out = snapshot();
-    if (/(^|&)detail=1(&|$)/.test(query)) { // 列出当前活跃通道（最多 100 条，按存活时间排序）
+    if (/(^|&)detail=1(&|$)/.test(query)) { // 列出当前活跃通道（最多 100 条，按存活时间排序，目标与来源均已脱敏）
       const now = Date.now();
       const list = [...registry].sort((a, b) => a.createdAt - b.createdAt).slice(0, 100).map((t) => ({
         who: t.label, state: t.state, ageSec: Math.round((now - t.createdAt) / 1000), idleSec: Math.round((now - t.lastActive) / 1000),
-        remote: t.remote ? `${t.remote.remoteAddress}:${t.remote.remotePort}` : null, mux: t.mux.size,
+        remote: t.remote && t.remote.remoteAddress ? `${maskIp(t.remote.remoteAddress)}:${t.remote.remotePort}` : null, mux: t.mux.size,
       }));
       out.channels = list;
     }
@@ -567,22 +616,28 @@ async function handleRequest(req, res) {
 
   // 内嵌式复古像素监控面板：GET /api/v1/console/<UUID>
   if (pathname.startsWith('/api/v1/console/')) {
+    const ip = clientIp(req);
+    if (isBanned(ip)) { stats.rejected++; return respond(res, 404); }
     if (req.method !== 'GET') return respond(res, 404);
-    const adminUser = USERS.find((u) => safeEq(pathname, '/api/v1/console/' + u.text));
-    if (!adminUser) return respond(res, 404);
+    const adminUser = matchUserPath(pathname, '/api/v1/console/');
+    if (!adminUser) { noteAuthFail(ip); return respond(res, 404); }
+    const nonce = crypto.randomBytes(16).toString('base64');
     res.setHeader('Cache-Control', 'no-store');
-    res.setHeader('Referrer-Policy', 'no-referrer');
+    applyBrowserSecurityHeaders(res);
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self';");
-    return res.end(renderAdminHtml(adminUser.text));
+    res.setHeader('Content-Security-Policy', `default-src 'self'; script-src 'nonce-${nonce}'; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; object-src 'none';`);
+    return res.end(renderAdminHtml(adminUser.text, nonce));
   }
 
   // 唯一客户端联机档案导出入口：GET /api/v1/profile/<UUID>（移除其余路径与查询参数，仅依据 User-Agent 智能识别客户端类型）
   if (pathname.startsWith('/api/v1/profile/')) {
+    const ip = clientIp(req);
+    if (isBanned(ip)) { stats.rejected++; return respond(res, 404); }
     if (req.method !== 'GET') return respond(res, 404);
-    const subUser = USERS.find((u) => safeEq(pathname, '/api/v1/profile/' + u.text));
-    if (!subUser) return respond(res, 404);
+    const subUser = matchUserPath(pathname, '/api/v1/profile/');
+    if (!subUser) { noteAuthFail(ip); return respond(res, 404); }
     res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
     {
       const rawHost = String(req.headers['x-forwarded-host'] || req.headers[':authority'] || req.headers.host || '127.0.0.1').split(',')[0].trim();
       let host = rawHost;
@@ -651,8 +706,9 @@ async function handleRequest(req, res) {
 
         if (accept.includes('text/html')) {
           res.setHeader('Cache-Control', 'no-store');
+          applyBrowserSecurityHeaders(res);
           res.setHeader('Content-Type', 'text/html; charset=utf-8');
-          res.setHeader('Content-Security-Policy', "default-src 'self'; style-src 'self' 'unsafe-inline';");
+          res.setHeader('Content-Security-Policy', "default-src 'self'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'self'; object-src 'none';");
           return res.end(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>NEON ARCADE // CLOUD SAVE STATE</title><style>body{background:#05060c;color:#00f5d4;font-family:monospace;padding:24px;line-height:1.6}h1{color:#fee440;font-size:16px;border-bottom:1px solid #00f5d4;padding-bottom:8px}pre{background:#0a0d18;padding:16px;border-radius:6px;color:#a8ffef;border:1px solid rgba(0,245,212,.3);overflow-x:auto}</style></head><body><h1>⚡ NEON ARCADE // CLOUD SAVEGAME ARCHIVE [SLOT 1]</h1><p>已成功从街机服务器同步当前玩家云存档快照与成就校验码：</p><pre>${JSON.stringify(saveState, null, 2)}</pre></body></html>`);
         }
         res.setHeader('Cache-Control', 'no-store');
@@ -770,7 +826,7 @@ async function handleRequest(req, res) {
   if (sid && !SID_RE.test(sid)) return respondJson(res, 404, { ok: false, error: 'not found' });
 
   const ip = clientIp(req);
-  const label = `[${ip || '?'}${sid ? ' ' + sid.slice(0, 8) : ''}]`;
+  const label = `[${maskIp(ip)}${sid ? ' ' + sid.slice(0, 8) : ''}]`;
   if (isBanned(ip)) { stats.rejected++; return respondJson(res, 404, { ok: false, error: 'not found' }); }
   if (sid && closedSessions.has(sid)) return respond(res, 410);
 
@@ -909,4 +965,4 @@ async function handleRequest(req, res) {
   return respondJson(res, 405, { ok: false, error: 'method not allowed' });
 }
 
-module.exports = { handler, handleRequest, extractMeta, extractHeaderPayload, clientIp };
+module.exports = { handler, handleRequest, extractMeta, extractHeaderPayload, clientIp, readBody };

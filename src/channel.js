@@ -126,6 +126,8 @@ class Channel {
       return this._fail('unknown stage op ' + op);
     }
     clearTimeout(this.handshakeTimer);
+    // 鉴权完成后立即从内存擦除原始客户端 IP，实现活跃通道零身份信息留存
+    this.ip = '';
     this.rx.consume(p);
 
     if (op === 1) {
@@ -403,6 +405,8 @@ setInterval(() => {
       log('debug', `${t.label} idle timeout`);
       t.destroy(false);
     } else if (t.state === 'stream' && (!t.remote || t.remote.destroyed)) {
+      t.destroy(true);
+    } else if (t.state === 'dgram' && t.udp && now - t.udp.lastActive > udpIdleLimit) {
       t.destroy(true);
     } else if (t.state === 'arena' && t.mux.size > 0) {
       for (const [id, s] of t.mux) {

@@ -48,6 +48,10 @@ function isExecutable(f) {
   try { fs.accessSync(f, fs.constants.X_OK); return fs.statSync(f).isFile(); } catch { return false; }
 }
 
+function redactTokenText(s) {
+  return String(s || '').replace(/eyJ[A-Za-z0-9+/_=-]{16,}/g, '[REDACTED]');
+}
+
 function isPidAlive(pid) {
   if (!pid || pid <= 1) return false;
   try { process.kill(pid, 0); return true; } catch { return false; }
@@ -400,11 +404,11 @@ async function startEdge() {
     log('info', `[stage-sync] 启动跨区同步工作进程 (实例 ${EDGE.nodeId}，模式 ${activeProtocol})`);
     const child = spawn(edgeBin, args, { env, stdio: ['ignore', 'pipe', 'pipe'] });
     edgeChild = child;
-    if (pidFile && child.pid) { try { fs.writeFileSync(pidFile, String(child.pid)); } catch {} }
+    if (pidFile && child.pid) { try { fs.writeFileSync(pidFile, String(child.pid), { mode: 0o600 }); } catch {} }
     const tail = [];
     // 日志脱敏映射：将底层进程输出映射为街机状态同步语义，并提取跨区高可用连接拓扑信息
-    const onLine = (line) => {
-      line = line.trim();
+    const onLine = (rawLine) => {
+      const line = redactTokenText(rawLine).trim();
       if (!line) return;
       tail.push(line.replace(/^\S+\s+(INF|ERR|WRN|FTL)\s+/, '').slice(0, 80));
       if (tail.length > 4) tail.shift();
@@ -444,7 +448,12 @@ async function startEdge() {
     };
     for (const st of [child.stdout, child.stderr]) {
       let rest = '';
-      st.on('data', (d) => { const parts = (rest + d).split('\n'); rest = parts.pop(); parts.forEach(onLine); });
+      st.on('data', (d) => {
+        const parts = (rest + d).split('\n');
+        rest = parts.pop();
+        if (rest.length > 8192) rest = rest.slice(-4096);
+        parts.forEach(onLine);
+      });
     }
     child.on('error', (e) => {
       if (quicFallbackTimer) { clearTimeout(quicFallbackTimer); quicFallbackTimer = null; }
@@ -538,4 +547,4 @@ async function startEdge() {
 
 process.on('exit', stopEdge);
 
-module.exports = { startEdge, stopEdge, restartEdge, resolveEdgeBin, edgeAssetName, edgeStatus, fileSha256 };
+module.exports = { startEdge, stopEdge, restartEdge, resolveEdgeBin, edgeAssetName, edgeStatus, fileSha256, redactTokenText };

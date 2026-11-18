@@ -7,7 +7,8 @@ const { CFG, BASE, uuidSource, EDGE, checkConfig } = require('./config');
 const { log } = require('./log');
 const { stats, recordAlert } = require('./stats');
 const { registry } = require('./channel');
-const { sessions } = require('./session');
+const { sessions, closedSessions } = require('./session');
+const { dnsCache } = require('./netutil');
 const { createServer } = require('./server');
 const { startEdge, stopEdge } = require('./edge');
 const { flushBoardSync } = require('./arcade');
@@ -111,6 +112,13 @@ function startSelfWatchdog(server) {
       for (const ch of registry) {
         if (now - ch.lastActive > 60000) ch.destroy(false);
       }
+      for (const [id, exp] of closedSessions) {
+        if (exp <= now) closedSessions.delete(id);
+      }
+      for (const [h, e] of dnsCache) {
+        if ((e.staleExp || e.exp) <= now) dnsCache.delete(h);
+      }
+      while (dnsCache.size > 256) dnsCache.delete(dnsCache.keys().next().value);
     }
 
     // 2) 监听套接字状态自检：若意外失联则自动重新绑定监听

@@ -106,13 +106,13 @@ class ChunkList {
 }
 
 function isPrivateIPv4Parts(a, b, c, d) {
-  return a === 0 || a === 10 || a === 127 ||
+  return a === 0 || a === 10 || a === 127 || a >= 224 ||
     (a === 169 && b === 254) ||
     (a === 172 && b >= 16 && b <= 31) ||
     (a === 192 && b === 168) ||
+    (a === 192 && b === 0 && c === 0) ||
     (a === 100 && b >= 64 && b <= 127) ||
-    (a === 198 && (b === 18 || b === 19)) ||
-    (a === 255 && b === 255 && c === 255 && d === 255);
+    (a === 198 && (b === 18 || b === 19));
 }
 
 function expandIPv6Groups(host) {
@@ -262,7 +262,14 @@ function queryDohSingle(prov, host, type) {
       timeout: 3500,
     }, (res) => {
       let data = '';
-      res.on('data', (c) => { if (data.length < 65536) data += c; });
+      res.setEncoding('utf8');
+      res.on('data', (c) => {
+        if (data.length + c.length > 65536) {
+          req.destroy(new Error('DoH payload exceeded 64KB'));
+          return;
+        }
+        data += c;
+      });
       res.on('end', () => {
         if (res.statusCode !== 200) return reject(new Error('DoH status ' + res.statusCode));
         try {
@@ -476,10 +483,23 @@ async function resolveHost(host) {
 
 // Happy Eyeballs (RFC 8305) 双栈快速并发回退连接器：
 // 首选 IP 若 250ms 内未完成握手，自动并发尝试备选 IP，首个成功者胜出并缓存为该域名的优选 IP
-const DANGEROUS_OUTBOUND_PORTS = new Set([23, 25, 135, 137, 138, 139, 445]);
+// 出站高危/滥用端口拦截表：阻断邮件垃圾外发、内网共享扫描、BT 流量及 UDP 反射放大端口，保护宿主机信誉
+const DANGEROUS_OUTBOUND_PORTS = new Set([
+  23, 25, 135, 137, 138, 139, 445, 465, 587,
+  6881, 6882, 6883, 6884, 6885, 6886, 6887, 6888, 6889,
+]);
+const DANGEROUS_UDP_ONLY_PORTS = new Set([1900, 11211]);
+
+function isBlockedOutboundPort(port, isUdp = false) {
+  const p = Number(port);
+  if (!Number.isInteger(p) || p < 1 || p > 65535) return true;
+  if (DANGEROUS_OUTBOUND_PORTS.has(p)) return true;
+  if (isUdp && DANGEROUS_UDP_ONLY_PORTS.has(p)) return true;
+  return false;
+}
 
 async function connectTcp(host, port) {
-  if (DANGEROUS_OUTBOUND_PORTS.has(Number(port))) {
+  if (isBlockedOutboundPort(port, false)) {
     throw new Error('blocked dangerous outbound port ' + port);
   }
   const check = (ip) => {
@@ -607,10 +627,20 @@ class DatagramRelay {
   }
   async send(host, port, data) {
     if (this.closed) return;
+    if (isBlockedOutboundPort(port, true)) {
+      throw new Error('blocked dangerous outbound port ' + port);
+    }
     this.lastActive = Date.now();
     const { address, family } = await resolveHost(host);
     if (this.closed) return;
-    this._sock(family).send(data, port, address, (e) => {
+    let sock;
+    try {
+      sock = this._sock(family);
+    } catch (e) {
+      if (!this.closed && this.onError) this.onError(e);
+      return;
+    }
+    sock.send(data, Number(port), address, (e) => {
       if (e) {
         log('debug', 'dgram send error', e.message);
         if (!this.closed && this.onError) this.onError(e);
@@ -638,6 +668,7 @@ module.exports = {
   DatagramRelay,
   UdpAssoc: DatagramRelay,
   isPrivateIP,
+  isBlockedOutboundPort,
   unpackEndpointMeta,
   packEndpointMeta,
   parseAddrPort,
