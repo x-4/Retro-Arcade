@@ -25,6 +25,7 @@ class Session {
     this.draining = false;
     this.closed = false;
     this.streamUp = false;
+    this.wasAuth = false;
     this.waiters = [];
     this.capWaiters = new Set();
     this.reserved = 0;
@@ -136,6 +137,7 @@ class Session {
         this._wake();
         try {
           if (item.data.length) await this.channel.push(item.data);
+          if (this.isAuth()) this.wasAuth = true;
           this._wake();
           item.resolve();
         } catch (e) {
@@ -157,7 +159,12 @@ class Session {
       totalReserved = Math.max(0, totalReserved - this.reserved);
       this.reserved = 0;
     }
-    if (sessions.get(this.id) === this) { sessions.delete(this.id); tombstone(this.id); }
+    const authenticated = this.wasAuth || Boolean(this.channel && this.channel.state !== 'init');
+    if (sessions.get(this.id) === this) {
+      sessions.delete(this.id);
+      // 仅对已完成首帧凭证校验的合法会话登记 410 墓碑，彻底杜绝未授权探测利用 410 状态码识别服务指纹
+      if (authenticated) tombstone(this.id);
+    }
     for (const it of this.pending.values()) it.reject(new Error('session closed'));
     this.pending.clear();
     for (const w of this.waiters) w();

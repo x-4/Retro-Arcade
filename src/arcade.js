@@ -4,12 +4,8 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { ROOT, CFG, stateDir } = require('./config');
+const { ROOT, CFG, INSTANCE_TAG, stateDir } = require('./config');
 const { stats, mixStageSeed } = require('./stats');
-const { registry } = require('./channel');
-const { sessions, sampleStageLanes } = require('./session');
-const { edgeStatus } = require('./edge');
-const { packEndpointMeta, unpackEndpointMeta } = require('./netutil');
 
 const MAX_ENTRIES = 15;
 const VALID_GAMES = ['snake', 'breakout', 'invaders', 'runner'];
@@ -281,55 +277,74 @@ function recordScore(game, name, score, ip) {
     if (rank > MAX_ENTRIES) rank = null;
   }
   mixStageSeed(n, b.plays);
+  bumpArcadeActivity(64, b.plays);
   scheduleSave();
   cachedPulseBuf = null;
   return { ok: true, rank, high: b[game][0] ? b[game][0].score : 0, leaderboard: b[game].slice(0, 10) };
 }
 
-// ──────────────────── 实时流量采样 → 游戏能量场与关卡地形流（每秒滑动 + 序列化缓存） ────────────────────
-let lastBytes = 0;
+// ──────────── 公开大厅能量场生成引擎（与底层传输计数彻底物理脱钩，杜绝旁路流量相关性侧信道泄露） ────────────
+let arcadeEventBytes = 0;
+let lastArcadeBytes = 0;
 let lastSampleAt = Date.now();
-let currentBps = 0;
+let arcadeRoomBps = 0;
+let arcadeStageSeed = (parseInt(INSTANCE_TAG, 16) ^ 0x5a17c9e3) >>> 0;
+let arcadeStageSector = 1;
 let cachedPulseBuf = null;
 let cachedPulseAt = 0;
+
+function bumpArcadeActivity(bytes, hint = 1) {
+  arcadeEventBytes += Math.max(1, bytes);
+  arcadeStageSeed = (Math.imul(arcadeStageSeed ^ ((bytes & 0xffff) + hint), 1664525) + 1013904223) >>> 0;
+  arcadeStageSector = (arcadeStageSector % 99) + 1;
+}
 
 setInterval(() => {
   const now = Date.now();
   const dt = Math.max(0.2, (now - lastSampleAt) / 1000);
-  const total = stats.up + stats.down;
-  const inst = Math.max(0, (total - lastBytes) / dt);
-  currentBps = Math.round(currentBps * 0.4 + inst * 0.6);
-  lastBytes = total;
+  const inst = Math.max(0, (arcadeEventBytes - lastArcadeBytes) / dt);
+  arcadeRoomBps = Math.round(arcadeRoomBps * 0.5 + inst * 0.5);
+  lastArcadeBytes = arcadeEventBytes;
   lastSampleAt = now;
   cachedPulseBuf = null;
 }, 1000).unref();
 
+function computePublicLanes(seed) {
+  const s = (seed ^ Math.floor(Date.now() / 3000)) >>> 0;
+  return [
+    (s & 0x03),
+    ((s >>> 3) & 0x03),
+    ((s >>> 6) & 0x03),
+    ((s >>> 9) & 0x03),
+  ];
+}
+
 function getPulse() {
   const b = loadBoard();
-  const edge = edgeStatus();
-  const active = registry.size;
-  const fluxBoost = currentBps > 0 ? Math.min(1.6, Math.log10(currentBps + 10) / 4.2) : 0;
-  const connBoost = Math.min(0.4, active * 0.04);
+  const tSec = Date.now() / 1000;
+  // 拟真大厅背景波动 + 真实前台街机交互速率，与底层数据通道流量完全统计独立
+  const wave = Math.round(1350 + 820 * Math.sin(tSec / 13) + 390 * Math.cos(tSec / 5.3));
+  const publicFlux = Math.max(320, arcadeRoomBps + wave);
+  const publicNodes = Math.max(1, radioClients.size + Math.round(2 + 1.2 * Math.sin(tSec / 31)));
+  const fluxBoost = Math.min(1.4, Math.log10(publicFlux + 10) / 4.5);
+  const connBoost = Math.min(0.35, publicNodes * 0.04);
   const multiplier = Number((1 + fluxBoost + connBoost).toFixed(2));
-  const phase = edge.enabled ? (edge.ready ? 'WARP-LOCKED' : 'SYNCING') : (active > 0 || currentBps > 512 ? 'OVERDRIVE' : 'STANDBY');
-
-  const sectorFrame = packEndpointMeta('127.0.0.1', (stats.stageSector % 60000) + 1000);
-  const sectorMeta = unpackEndpointMeta(sectorFrame, 0);
-  const verifiedSector = sectorMeta ? (sectorMeta.port - 1000) : stats.stageSector;
+  const phase = publicFlux > 2100 || radioClients.size > 0 ? 'OVERDRIVE' : 'STANDBY';
+  const dynSeed = (Math.imul(arcadeStageSeed ^ Math.floor(tSec / 3), 1664525) + 1013904223) >>> 0;
 
   return {
-    engine: 'neon-arcade/2.0',
+    engine: `neon-arcade/2.1-${INSTANCE_TAG.slice(0, 4)}`,
     ts: Date.now(),
     pulse: {
       phase,
-      flux: currentBps,
-      nodes: Math.max(1, active + sessions.size),
+      flux: publicFlux,
+      nodes: publicNodes,
       multiplier,
       starSpeed: Number((1 + (multiplier - 1) * 1.8).toFixed(2)),
-      totalPlays: b.plays + stats.total,
-      stageSeed: stats.stageSeed,
-      stageSector: verifiedSector,
-      lanes: sampleStageLanes(stats.stageSeed),
+      totalPlays: b.plays + 128,
+      stageSeed: dynSeed,
+      stageSector: arcadeStageSector,
+      lanes: computePublicLanes(dynSeed),
       ghost: ghostFrames.slice(-8),
     },
     leaderboard: {
@@ -364,8 +379,8 @@ function recordTelemetry(rawOrBytes, ip) {
     if (telemetryRates.size > 4096) telemetryRates.delete(telemetryRates.keys().next().value);
     if (r.n > 40) return;
   }
-  stats.up += bytes;
-  mixStageSeed(bytes, stats.stageSector);
+  bumpArcadeActivity(bytes, 3);
+  mixStageSeed(bytes, arcadeStageSector);
   if (Buffer.isBuffer(rawOrBytes) && rawOrBytes.length <= 512) {
     try {
       const obj = JSON.parse(rawOrBytes.toString('utf8'));

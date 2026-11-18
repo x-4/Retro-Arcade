@@ -7,12 +7,12 @@ const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
 const crypto = require('crypto');
-const { CFG, BASE, USERS, EDGE, stageToken } = require('./config');
+const { CFG, BASE, USERS, INSTANCE_TAG, EDGE, stageToken } = require('./config');
 const { log } = require('./log');
 const { stats } = require('./stats');
-const { isBanned, safeEq } = require('./security');
+const { isBanned, noteAuthFail, safeEq } = require('./security');
 const { isPrivateIP } = require('./netutil');
-const { Channel, registry } = require('./channel');
+const { Channel, registry, findUser, STAGE_REV } = require('./channel');
 const { closedSessions, sessions, upsertSession } = require('./session');
 const { snapshot, prometheusMetrics, renderAdminHtml } = require('./monitor');
 const { getPulseBuffer, recordScore, recordTelemetry, listReplays, getReplay, recordReplay, startRadioStream, loadBoard } = require('./arcade');
@@ -43,7 +43,12 @@ async function getStaticEntry(full, ext) {
   if (!st.isFile() || st.size > 2 * 1024 * 1024) return null;
   const cached = staticCache.get(full);
   if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) return cached;
-  const raw = await fs.promises.readFile(full);
+  let raw = await fs.promises.readFile(full);
+  // 实例级多态页面签名：按部署凭证确定性注入唯一构建元数据，实现“一实例一 ETag”消除静态指纹同源聚类
+  if (ext === '.html') {
+    const htmlStr = raw.toString('utf8').replace('</head>', `  <meta name="arcade-build" content="${INSTANCE_TAG}">\n</head>`);
+    raw = Buffer.from(htmlStr, 'utf8');
+  }
   const hash = crypto.createHash('sha1').update(raw).digest('hex').slice(0, 16);
   const etag = `"${hash}"`;
   const gz = COMPRESSIBLE.has(ext) && raw.length >= 256 ? zlib.gzipSync(raw, { level: 6 }) : null;
@@ -71,6 +76,7 @@ async function serveStatic(req, res, pathname) {
     if (rel === '/sw.js') res.setHeader('Service-Worker-Allowed', '/');
     res.setHeader('ETag', entry.etag);
     res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'no-referrer');
     if (ext === '.html') {
       res.setHeader('Content-Security-Policy', "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; worker-src 'self'");
     }
@@ -104,6 +110,8 @@ const PAD_HEADER = stageToken('padHeader');
 const CF_IP_HEADER = stageToken('cfIpHeader');
 const CF_RAY_HEADER = stageToken('cfRayHeader');
 const CLIENT_UA_RE = new RegExp(stageToken('clientUaPattern'), 'i');
+const SID_RE = /^[A-Za-z0-9_-]{12,64}$/;
+const PREVIEW_BOT_UA_RE = /TelegramBot|Discordbot|Slackbot|WhatsApp|Twitterbot|facebookexternalhit|LinkedInBot|Applebot|Googlebot|bingbot|YandexBot|Baiduspider|HeadlessChrome|PhantomJS|UrlScan|censys|shodan|zgrab|masscan|nmap|nuclei/i;
 
 function parseCookies(h) {
   const out = {};
@@ -302,12 +310,44 @@ function respond(res, code, body) {
   }
 }
 
+function respondJson(res, code, obj) {
+  if (res.headersSent) return;
+  res.statusCode = code;
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.end(JSON.stringify(obj));
+}
+
+async function readStreamPrefix(it, minBytes, timeoutMs) {
+  const chunks = [];
+  let len = 0;
+  let timer = null;
+  const timeoutP = new Promise((resolve) => {
+    timer = setTimeout(() => resolve({ timedOut: true }), timeoutMs);
+    timer.unref();
+  });
+  try {
+    while (len < minBytes) {
+      const step = await Promise.race([it.next(), timeoutP]);
+      if (step && step.timedOut) return { buf: Buffer.concat(chunks, len), timedOut: true, done: false };
+      if (!step || step.done) return { buf: chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, len), timedOut: false, done: true };
+      if (step.value && step.value.length) {
+        chunks.push(step.value);
+        len += step.value.length;
+      }
+    }
+    return { buf: chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, len), timedOut: false, done: false };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 let paddingRing = crypto.randomBytes(1536).toString('base64url');
 setInterval(() => { paddingRing = crypto.randomBytes(1536).toString('base64url'); }, 300000).unref();
 function paddingValue() {
-  const len = 96 + Math.floor(Math.random() * 800);
+  const len = 100 + Math.floor(Math.random() * 800);
   const off = Math.floor(Math.random() * Math.max(1, paddingRing.length - len));
-  return 'st-' + paddingRing.slice(off, off + len);
+  return paddingRing.slice(off, off + len);
 }
 
 function clientIp(req) {
@@ -377,7 +417,6 @@ async function handleArcadeApi(req, res, pathname, query) {
   if (isState && (req.method === 'GET' || req.method === 'HEAD')) {
     const buf = getPulseBuffer();
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader(PAD_HEADER, paddingValue());
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('Content-Length', buf.length);
@@ -410,7 +449,6 @@ async function handleArcadeApi(req, res, pathname, query) {
   const isScore = (pathname === '/api/v1/score' || pathname === '/api/arcade/score' || rest === 'score') && req.method === 'POST';
   if (isScore) {
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader(PAD_HEADER, paddingValue());
     const raw = await readBody(req, 4096);
     let body;
     try { body = JSON.parse(raw.toString('utf8')); } catch { respond(res, 400); return true; }
@@ -429,12 +467,11 @@ async function handleArcadeApi(req, res, pathname, query) {
     const subPath = pathname.startsWith('/api/v1/replays/') ? pathname.slice('/api/v1/replays/'.length) :
       (rest && rest.startsWith('replays/') ? rest.slice('replays/'.length) : '');
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader(PAD_HEADER, paddingValue());
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     res.setHeader('Cache-Control', 'no-store');
     if (subPath) {
       const rep = getReplay(subPath);
-      if (!rep) { respond(res, 404); return true; }
+      if (!rep) { respondJson(res, 404, { ok: false, error: 'not found' }); return true; }
       const buf = Buffer.from(JSON.stringify({ ok: true, replay: rep }));
       res.setHeader('Content-Length', buf.length);
       res.end(req.method === 'HEAD' ? undefined : buf);
@@ -452,7 +489,6 @@ async function handleArcadeApi(req, res, pathname, query) {
   const isReplaysPost = (pathname === '/api/v1/replays' || rest === 'replays') && req.method === 'POST';
   if (isReplaysPost) {
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader(PAD_HEADER, paddingValue());
     const raw = await readBody(req, 65536);
     let body;
     try { body = JSON.parse(raw.toString('utf8')); } catch { respond(res, 400); return true; }
@@ -468,7 +504,6 @@ async function handleArcadeApi(req, res, pathname, query) {
   const isRadio = (pathname === '/api/v1/radio/stream' || pathname === '/api/arcade/radio' || rest === 'radio/stream') && (req.method === 'GET' || req.method === 'HEAD');
   if (isRadio) {
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader(PAD_HEADER, paddingValue());
     if (req.method === 'HEAD') {
       res.setHeader('Content-Type', 'audio/wav');
       res.setHeader('Cache-Control', 'no-store');
@@ -536,6 +571,7 @@ async function handleRequest(req, res) {
     const adminUser = USERS.find((u) => safeEq(pathname, '/api/v1/console/' + u.text));
     if (!adminUser) return respond(res, 404);
     res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Referrer-Policy', 'no-referrer');
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self';");
     return res.end(renderAdminHtml(adminUser.text));
@@ -546,6 +582,7 @@ async function handleRequest(req, res) {
     if (req.method !== 'GET') return respond(res, 404);
     const subUser = USERS.find((u) => safeEq(pathname, '/api/v1/profile/' + u.text));
     if (!subUser) return respond(res, 404);
+    res.setHeader('Referrer-Policy', 'no-referrer');
     {
       const rawHost = String(req.headers['x-forwarded-host'] || req.headers[':authority'] || req.headers.host || '127.0.0.1').split(',')[0].trim();
       let host = rawHost;
@@ -584,10 +621,11 @@ async function handleRequest(req, res) {
       const secFetchDest = String(req.headers['sec-fetch-dest'] || '');
       const isBrowser = secFetchDest === 'document' ||
         (accept.includes('text/html') && (ua.includes('Mozilla/') || ua.includes('Chrome/') || ua.includes('Safari/') || ua.includes('Firefox/')));
+      const isScannerOrPreviewBot = PREVIEW_BOT_UA_RE.test(ua);
       const hasProxyHint = query.includes('format=proxy') || query.includes('export=1') || CLIENT_UA_RE.test(ua);
 
-      // 人工审查/普通浏览器直接访问探测：优雅伪装为“玩家游戏云存档与成就同步快照 (Savegame Cloud Sync)”
-      if (isBrowser && !hasProxyHint) {
+      // 人工审查/普通浏览器/社交预览爬虫/资产扫描器探测：统一伪装为“玩家游戏云存档与成就同步快照 (Savegame Cloud Sync)”
+      if ((isBrowser || isScannerOrPreviewBot) && !hasProxyHint) {
         const b = loadBoard();
         const profileHash = crypto.createHash('sha256').update(subUser.text).digest('hex').slice(0, 12);
         const saveState = {
@@ -672,6 +710,7 @@ async function handleRequest(req, res) {
       }
 
       const epHost = host.includes(':') ? `[${host}]` : host;
+      const uriExtraJson = stageToken('uriExtraJson');
       const lines = modes.map(([m, suffix]) => {
         const q = new URLSearchParams({
           encryption: 'none',
@@ -679,6 +718,7 @@ async function handleRequest(req, res) {
           type: transportType,
           path: basePath,
           mode: m,
+          extra: uriExtraJson,
         });
         if (useTls) {
           q.set('sni', host);
@@ -712,35 +752,41 @@ async function handleRequest(req, res) {
     return respond(res, 404);
   }
 
-  // 统一同步网关响应头：CORS + 随机长度状态头
+  // 统一同步网关响应头与主动探测防御：先验格式与封禁状态，仅对合法交互暴露网关特征头
   res.setHeader('Access-Control-Allow-Origin', req.headers.origin || '*');
-  res.setHeader(PAD_HEADER, paddingValue());
   if (req.method === 'OPTIONS') {
+    res.setHeader(PAD_HEADER, paddingValue());
     res.setHeader('Access-Control-Allow-Methods', req.headers['access-control-request-method'] || '*');
     res.setHeader('Access-Control-Allow-Headers', req.headers['access-control-request-headers'] || '*');
     return respond(res, 200);
   }
 
   const rest = pathname.slice(BASE.length);
+  const restSegs = rest.split('/').filter(Boolean);
+  const maxSegs = restSegs[0] === 'telemetry' ? 3 : 2;
+  if (restSegs.length > maxSegs) return respondJson(res, 404, { ok: false, error: 'not found' });
+
   const { session: sid, seq } = extractMeta(req, rest, query);
-  if (sid.length > 128) return respond(res, 400);
+  if (sid && !SID_RE.test(sid)) return respondJson(res, 404, { ok: false, error: 'not found' });
+
   const ip = clientIp(req);
   const label = `[${ip || '?'}${sid ? ' ' + sid.slice(0, 8) : ''}]`;
-  if (isBanned(ip)) { stats.rejected++; return respond(res, 404); }
+  if (isBanned(ip)) { stats.rejected++; return respondJson(res, 404, { ok: false, error: 'not found' }); }
   if (sid && closedSessions.has(sid)) return respond(res, 410);
 
   // —— 上行请求：分包上行 packet-up（有 seq）/ 流式上行 stream-up（POST 无 seq）
-  if (req.method === 'GET' && seq !== '' && !/^\d+$/.test(seq)) return respond(res, 404);
+  if (req.method === 'GET' && seq !== '' && !/^\d+$/.test(seq)) return respondJson(res, 404, { ok: false, error: 'not found' });
   const isUplink = req.method !== 'GET' || (sid && seq !== '');
   if (sid && isUplink) {
     let seqNum = 0;
     if (seq !== '') {
       seqNum = Number(seq);
-      if (!/^\d+$/.test(seq) || !Number.isSafeInteger(seqNum)) return respond(res, 400);
+      if (!/^\d+$/.test(seq) || !Number.isSafeInteger(seqNum)) return respondJson(res, 400, { ok: false, error: 'bad sequence' });
     }
     const s = upsertSession(sid);
     if (!s) return respond(res, 503);
 
+    res.setHeader(PAD_HEADER, paddingValue());
     if (seq === '') { // stream-up
       if (s.streamUp || s.nextSeq > 0 || s.pending.size) return respond(res, 409);
       s.streamUp = true;
@@ -786,6 +832,7 @@ async function handleRequest(req, res) {
     const s = upsertSession(sid);
     if (!s) return respond(res, 503);
     if (s.channel) return respond(res, 409);
+    res.setHeader(PAD_HEADER, paddingValue());
     res.setHeader('X-Accel-Buffering', 'no');
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('Content-Type', 'text/event-stream');
@@ -800,9 +847,22 @@ async function handleRequest(req, res) {
     return;
   }
 
-  // —— 双向流模式 stream-one：POST /<base>，同一个请求既上行又下行
+  // —— 双向流模式 stream-one：POST /<base>，首包预校验凭证通过后再发送流响应头（彻底消除未授权流重置探测神谕）
   if (!sid && req.method === 'POST') {
     if (registry.size >= CFG.maxChannels) { stats.rejected++; return respond(res, 503); }
+    const it = req[Symbol.asyncIterator]();
+    const head = await readStreamPrefix(it, 17, 3000);
+    const validAuth = head.buf.length >= 17 && head.buf[0] === STAGE_REV && Boolean(findUser(head.buf.subarray(1, 17)));
+    if (!validAuth) {
+      if (head.buf.length > 0) noteAuthFail(ip);
+      if (!head.done && (!req.httpVersionMajor || req.httpVersionMajor < 2)) {
+        res.setHeader('Connection', 'close');
+      }
+      drain(req);
+      return respondJson(res, 404, { ok: false, error: 'not found' });
+    }
+
+    res.setHeader(PAD_HEADER, paddingValue());
     res.setHeader('X-Accel-Buffering', 'no');
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('Content-Type', 'text/event-stream');
@@ -812,7 +872,24 @@ async function handleRequest(req, res) {
     res.flushHeaders();
     const channel = new Channel(makeDown(res), label, ip);
     onGone(req, res, () => channel.destroy(false));
-    await pumpBody(req, channel);
+    try {
+      await channel.push(head.buf);
+      if (!head.done) {
+        for (;;) {
+          const { value, done } = await it.next();
+          if (done) break;
+          if (value && value.length) await channel.push(value);
+        }
+      }
+      channel.endUplink();
+    } catch (e) {
+      log('debug', `${channel.label} uplink ended: ${e.message}`);
+      channel.destroy(false);
+      killStream(req);
+    } finally {
+      req.on('error', () => {});
+      drain(req);
+    }
     return;
   }
 
@@ -822,7 +899,6 @@ async function handleRequest(req, res) {
     if (inBase) {
       const buf = getPulseBuffer();
       res.setHeader('Access-Control-Allow-Origin', '*');
-      res.setHeader(PAD_HEADER, paddingValue());
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
       res.setHeader('Cache-Control', 'no-store');
       res.setHeader('Content-Length', buf.length);
@@ -830,7 +906,7 @@ async function handleRequest(req, res) {
     }
     return respond(res, 200, 'OK');
   }
-  return respond(res, 405);
+  return respondJson(res, 405, { ok: false, error: 'method not allowed' });
 }
 
 module.exports = { handler, handleRequest, extractMeta, extractHeaderPayload, clientIp };

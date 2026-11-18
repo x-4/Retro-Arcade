@@ -5,7 +5,7 @@ services:
     container_name: neon-arcade
     restart: unless-stopped
     ports:
-      - "${PORT:-8080}:${PORT:-8080}/tcp"
+      - "${LISTEN_IP:-0.0.0.0}:${PORT:-8080}:${PORT:-8080}/tcp"
     environment:
       PORT: "${PORT:-8080}"
       UUID: "${UUID:-}"

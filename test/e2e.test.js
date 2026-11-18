@@ -468,11 +468,17 @@ setInterval(() => {}, 10000);
     assert.strictEqual(r1.headers['content-encoding'], 'gzip');
     assert.ok(r1.headers.etag);
     assert.ok(r1.headers['content-security-policy']);
+    assert.strictEqual(r1.headers['referrer-policy'], 'no-referrer');
     const html = zlib.gunzipSync(r1.body).toString('utf8');
-    assert.ok(html.includes('NEON PIXEL'));
+    assert.ok(html.includes('NEON PIXEL') && html.includes('name="arcade-build"'));
     const r2 = await httpReq('/', { headers: { 'If-None-Match': r1.headers.etag } });
     assert.strictEqual(r2.status, 304);
     assert.strictEqual(r2.body.length, 0);
+
+    const rob = await httpReq('/robots.txt');
+    assert.strictEqual(rob.status, 200);
+    assert.strictEqual(rob.body.toString('utf8').includes('/__stats/'), false);
+    assert.ok(rob.body.toString('utf8').includes('Disallow: /api/'));
 
     const sw = await httpReq('/sw.js');
     assert.strictEqual(sw.status, 200);
@@ -484,9 +490,13 @@ setInterval(() => {}, 10000);
   await run('arcade API: SSE events stream + sequenced telemetry packets + leaderboard + rate limit', async () => {
     const st = await httpReq(`${PATHP}/state`);
     assert.strictEqual(st.status, 200);
+    assert.strictEqual(st.headers['x-padding'], undefined);
     const pulseObj = JSON.parse(st.body.toString('utf8'));
     assert.ok(pulseObj.pulse && pulseObj.leaderboard && Array.isArray(pulseObj.leaderboard.invaders) && Array.isArray(pulseObj.leaderboard.runner));
     assert.ok(typeof pulseObj.pulse.stageSeed === 'number' && Array.isArray(pulseObj.pulse.lanes));
+    // 验证公开状态接口与底层传输流量/边缘连接状态物理脱钩（无 WARP-LOCKED 状态词，且不反射前面 >1MB 测试流量）
+    assert.notStrictEqual(pulseObj.pulse.phase, 'WARP-LOCKED');
+    assert.ok(pulseObj.pulse.flux < 50000);
 
     // 测试 /api/v1/events SSE 下行流
     const sseFirstChunk = await new Promise((resolve, reject) => {
@@ -510,7 +520,7 @@ setInterval(() => {}, 10000);
       body: Buffer.from(JSON.stringify({ t: Date.now(), g: 'snake', e: 'food' })),
     });
     assert.strictEqual(telResp.status, 200);
-    assert.ok(telResp.headers['x-padding'] && telResp.headers['x-padding'].startsWith('st-'));
+    assert.ok(telResp.headers['x-padding'] && telResp.headers['x-padding'].length >= 100 && !telResp.headers['x-padding'].startsWith('st-'));
 
     const muxSid = crypto.randomUUID();
     const muxClient = makeClient(false);
@@ -585,13 +595,38 @@ setInterval(() => {}, 10000);
   });
 
   await run('bad uuid rejected & public IP banned after 3 failures', async () => {
+    // 验证主动探测防御：未知子路径立即返回 404 JSON（不挂起 30s、无 x-padding、二次访问不触发 410 墓碑）
+    const t0 = Date.now();
+    const unk1 = await httpReq('/api/v1/docs');
+    const unk2 = await httpReq('/api/v1/docs');
+    assert.ok(Date.now() - t0 < 1000);
+    assert.strictEqual(unk1.status, 404);
+    assert.strictEqual(unk2.status, 404);
+    assert.strictEqual(unk1.headers['x-padding'], undefined);
+    assert.ok(String(unk1.headers['content-type']).includes('application/json'));
+
+    // 验证未完成鉴权的随机 UUID 探测会话关闭后不进入 410 墓碑池
+    const unauthSid = crypto.randomUUID();
+    const unauthProbe = makeClient(false);
+    const gUnauth = unauthProbe.request('GET', `/api/v1/${unauthSid}`);
+    await gUnauth.resp;
+    gUnauth.abort();
+    unauthProbe.close();
+    await new Promise((r) => setTimeout(r, 50));
+    const afterUnauth = await httpReq(`/api/v1/${unauthSid}/0`, { method: 'POST', body: Buffer.from('probe') });
+    assert.notStrictEqual(afterUnauth.status, 410);
+
+    // 验证 stream-one 首包预校验：封禁前后均统一返回 404 JSON，绝不提前暴露 200 text/event-stream 或 x-padding
     const attackerIp = '203.0.113.99';
     for (let i = 0; i < 3; i++) {
-      await httpReq(PATHP + '/', {
+      const rBad = await httpReq(PATHP + '/', {
         method: 'POST',
         headers: { 'CF-Connecting-IP': attackerIp },
         body: frameHeader(1, '127.0.0.1', TP, crypto.randomUUID()),
       });
+      assert.strictEqual(rBad.status, 404);
+      assert.strictEqual(rBad.headers['x-padding'], undefined);
+      assert.ok(String(rBad.headers['content-type']).includes('application/json'));
     }
     const bannedResp = await httpReq(PATHP + '/', {
       method: 'POST',
@@ -599,6 +634,7 @@ setInterval(() => {}, 10000);
       body: frameHeader(1, '127.0.0.1', TP, UUID),
     });
     assert.strictEqual(bannedResp.status, 404);
+    assert.strictEqual(bannedResp.headers['x-padding'], undefined);
   });
 
   await run('healthz + readyz + stats JSON + Prometheus metrics + 404', async () => {
@@ -675,6 +711,21 @@ setInterval(() => {}, 10000);
     assert.ok(decodedEdgeLines[0].startsWith(`${expectedScheme}${UUID}@example.com:443?`));
     assert.ok(decodedEdgeLines[0].includes('path=%2Fapi%2Fv1') && decodedEdgeLines[0].includes('mode=packet-up') && decodedEdgeLines[0].includes('security=tls') && decodedEdgeLines[0].endsWith('#neon-arcade'));
     assert.ok(decodedEdgeLines[1].includes('mode=auto') && decodedEdgeLines[1].endsWith('#neon-arcade-backup'));
+    const parsedUri = new URL(decodedEdgeLines[0]);
+    const parsedExtra = JSON.parse(parsedUri.searchParams.get('extra'));
+    assert.strictEqual(parsedExtra.xPaddingBytes, '100-1000');
+    assert.strictEqual(parsedExtra.scMaxEachPostBytes, 1000000);
+
+    // 验证社交预览机器人与测绘扫描器 UA 访问档案入口时自动返回云存档伪装，防止链接预览泄露配置
+    for (const botUa of ['TelegramBot (like TwitterBot)', 'Slackbot-LinkExpanding 1.0', 'Mozilla/5.0 (compatible; CensysInspect/1.1)']) {
+      const botResp = await httpReq(`/api/v1/profile/${UUID}`, {
+        headers: { Host: 'example.com', 'User-Agent': botUa },
+      });
+      assert.strictEqual(botResp.status, 200);
+      assert.ok(String(botResp.headers['content-type']).includes('application/json'));
+      const botSave = JSON.parse(botResp.body.toString('utf8'));
+      assert.strictEqual(botSave.player, 'NEO-OPERATOR');
+    }
 
     // 验证本地/直连 HTTP 访问（且 URL 查询参数如 ?target=yaml&raw=1 完全失效，仅依据 User-Agent 识别）
     const b64Local = await httpReq(`/api/v1/profile/${UUID}?target=yaml&raw=1`, {
